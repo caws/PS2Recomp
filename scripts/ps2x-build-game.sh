@@ -321,11 +321,16 @@ if [ "$SKIP_BUILD" = false ]; then
     # The RelWithDebInfo flags are passed EVERY time, not left to the cache: CMake caches them, so a
     # one-off --no-debug-info would otherwise silently strip every later build of the same tree.
     if [[ "$DEBUG_INFO" == true ]]; then RWDI_FLAGS="-O2 -g -DNDEBUG"; else RWDI_FLAGS="-O2 -DNDEBUG"; fi
+    # The C++ runtime (libstdc++, libgcc) is linked in, so the runner starts on a machine without
+    # gcc-13's runtime library -- most distributions ship an older one, and a binary built in a
+    # container must run on the host. PS2X_STATIC_LIBSTDCXX=0 links them dynamically (as before).
+    LINK_FLAGS="-pthread -fuse-ld=lld"
+    [[ "${PS2X_STATIC_LIBSTDCXX:-1}" == 0 ]] || LINK_FLAGS+=" -static-libstdc++ -static-libgcc"
     cmake -S "$PS2RECOMP_ROOT" -B "$PS2RECOMP_ROOT/out/build" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
         -DCMAKE_C_FLAGS_RELWITHDEBINFO="$RWDI_FLAGS" \
         -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="$RWDI_FLAGS" \
-        -DCMAKE_EXE_LINKER_FLAGS="-pthread -fuse-ld=lld"
+        -DCMAKE_EXE_LINKER_FLAGS="$LINK_FLAGS"
     cmake --build "$PS2RECOMP_ROOT/out/build" \
         --target ps2EntryRunner \
         --config "$BUILD_TYPE" \
