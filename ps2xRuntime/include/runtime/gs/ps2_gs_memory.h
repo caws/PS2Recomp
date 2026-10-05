@@ -263,6 +263,14 @@ namespace GSMem
 		// reads the pixel
 		static constexpr auto Read(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y) -> PackedT;
 
+		// ★★ cont.225: the same pair taking an ALREADY-COMPUTED pixel address, so a
+		// read-modify-write computes Address() once. cont.224 proved this only pays when the calls
+		// are INLINED -- routing it through extra function pointers cost more than the arithmetic
+		// saved (N indirect calls became N+1, and it measured 1-4% SLOWER). Read/Write below split
+		// at exactly this line, so the two forms cannot drift.
+		static constexpr void WriteAt(u8* data, u32 pixel_addr, PackedT value);
+		static constexpr auto ReadAt(u8* data, u32 pixel_addr) -> PackedT;
+
 		static_assert(BlocksPerPage() == BLOCKS_PER_PAGE);
 		static_assert(IsValidPsm(psm));
 	};
@@ -460,7 +468,12 @@ namespace GSMem
 	template<PixelStorageMode psm>
 	constexpr void PixelStorageTraits<psm>::Write(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y, PackedT value)
 	{
-		const u32 pixel_addr = Address(table, block, bw, x, y);
+		WriteAt(data, Address(table, block, bw, x, y), value);
+	}
+
+	template<PixelStorageMode psm>
+	constexpr void PixelStorageTraits<psm>::WriteAt(u8* data, u32 pixel_addr, PackedT value)
+	{
 		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + BitOffset();
 		const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
 		const u32 shift = bits % 8;
@@ -503,7 +516,12 @@ namespace GSMem
 	template<PixelStorageMode psm>
 	constexpr auto PixelStorageTraits<psm>::Read(const PageLookupTableT& table, u8* data, u32 block, u32 bw, u32 x, u32 y) -> PackedT
 	{
-		const u32 pixel_addr = Address(table, block, bw, x, y);
+		return ReadAt(data, Address(table, block, bw, x, y));
+	}
+
+	template<PixelStorageMode psm>
+	constexpr auto PixelStorageTraits<psm>::ReadAt(u8* data, u32 pixel_addr) -> PackedT
+	{
 		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + BitOffset();
 		const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
 		const u32 shift = bits % 8;
@@ -535,6 +553,21 @@ namespace GSMem
 
 		return 0xFFFF00FFu;
 	}
+
+	// ★★ cont.225: the CT32 frame / Z24 depth tables are visible across translation units so the
+	// rasterizer can call PixelStorageTraits<> DIRECTLY and have Address/ReadAt/WriteAt inline.
+	// That is the whole point -- cont.224 showed the ~24% swizzle block is indirect-call and cache
+	// cost, not arithmetic, so the win comes from REMOVING calls. (Z24 shares Z32's table, exactly
+	// as ReadZ24/WriteZ24 already do.)
+	extern PixelStorageTraits<C32>::PageLookupTableT PageTableC32;
+	extern PixelStorageTraits<Z32>::PageLookupTableT PageTableZ32;
+	// ★★ cont.228: the same treatment for the dominant TEXTURE format. A per-texel census
+	// (PS2X_GS_TEXCENSUS) measured 83.0% of all texel fetches as PSMT4, and each one reached VRAM
+	// through the m_draw.texRead function pointer -> ReadP4 -> here. Exposing the table lets
+	// SampleTexture call the traits directly so the whole lookup inlines.
+	extern PixelStorageTraits<P4>::PageLookupTableT PageTableP4;
+	// cont.317: and PSMT8, the format that carries half of the Helm's Deep raster time (PS2X_GS_KEYCENSUS).
+	extern PixelStorageTraits<P8>::PageLookupTableT PageTableP8;
 
 	void InitLookupTables();
 

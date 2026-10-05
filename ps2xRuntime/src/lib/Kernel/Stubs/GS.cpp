@@ -114,12 +114,15 @@ namespace ps2_stubs
                 return;
             }
 
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2a.reg & 0xFFu), clear.xyz2a.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2b.reg & 0xFFu), clear.xyz2b.value);
-            runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+            // cont.318: ordered with the packet stream when the pipeline thread is on (see Support.h).
+            gsWriteRegisterOrdered(runtime, static_cast<uint8_t>(clear.testa.reg & 0xFFu), clear.testa.value);
+            gsWriteRegisterOrdered(runtime, static_cast<uint8_t>(clear.prim.reg & 0xFFu), clear.prim.value);
+            gsWriteRegisterOrdered(runtime, static_cast<uint8_t>(clear.rgbaq.reg & 0xFFu), clear.rgbaq.value);
+            gsWriteRegisterOrdered(runtime, static_cast<uint8_t>(clear.xyz2a.reg & 0xFFu), clear.xyz2a.value);
+            gsWriteRegisterOrdered(runtime, static_cast<uint8_t>(clear.xyz2b.reg & 0xFFu), clear.xyz2b.value);
+            gsWriteRegisterOrdered(runtime, static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+            if (ps2gs::threaded() && ps2gs::producerSide())
+                ps2gs::pump();
         }
 
         void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
@@ -631,7 +634,13 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // LOCAL FIX (LOTR EUR, 2026-07-13): sceGsLoadImage's vramadr is in 64-word (256-byte)
+        // units, i.e. GS BLOCKS — pass it straight through as the BITBLTBUF DBP. The old
+        // *2048/256 (x8) conversion, truncated by the 14-bit DBP field, scattered every upload
+        // to (addr*8 mod 16384): fonts 8192/9237/10034/10781 landed at 0/8360/14736/4328 and
+        // the font CLUTs 12288/12289/12290 at 0/8/16, so the drawn TEX0s always sampled empty
+        // VRAM (invisible menu text). Verified against the game's own TEX0s and upload census.
+        uint32_t dbp = static_cast<uint32_t>(img.vram_addr);
         uint32_t dsax = static_cast<uint32_t>(img.x);
         uint32_t dsay = static_cast<uint32_t>(img.y);
 
@@ -696,7 +705,8 @@ namespace ps2_stubs
             return;
         }
 
-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // LOCAL FIX (LOTR EUR, 2026-07-13): same block-units convention as ExecLoadImage above.
+        uint32_t sbp = static_cast<uint32_t>(img.vram_addr);
         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
@@ -1167,7 +1177,7 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                gsClearFramebufferOrdered(runtime, clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
             }
             applyGsClearPacket(runtime, db.clear0);
         }
@@ -1178,7 +1188,7 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                gsClearFramebufferOrdered(runtime, clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
             }
             applyGsClearPacket(runtime, db.clear1);
         }

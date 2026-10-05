@@ -27,6 +27,40 @@ static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t si
         }
     }
 
+    // cont.317: one resolve per side and a memcpy when both ranges are contiguous in their region.
+    // perf on the live game had this byte loop (getMemPtr + getConstMemPtr per byte) at 2.5-5% of
+    // the EE thread: the game's audio-command flushes push ~16 KB per SIF call. The byte loop stays
+    // for anything that is not plainly contiguous (region wrap, a null resolve) and for overlapping
+    // ranges, whose forward byte-by-byte propagation memcpy/memmove would not reproduce.
+    {
+        uint32_t dOff = 0, sOff = 0; bool dScr = false, sScr = false;
+        if (ps2ResolveGuestPointer(dst, dOff, dScr) && ps2ResolveGuestPointer(src, sOff, sScr))
+        {
+            const uint32_t dLim = dScr ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+            const uint32_t sLim = sScr ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+            uint8_t *dBase = dScr ? ps2GetScratchpadHostPtr() : rdram;
+            const uint8_t *sBase = sScr ? ps2GetScratchpadHostPtr() : rdram;
+            if (dBase && sBase && dOff + clampedSize <= dLim && sOff + clampedSize <= sLim)
+            {
+                uint8_t *d = dBase + dOff; const uint8_t *sp = sBase + sOff;
+                const bool overlap = (d < sp + clampedSize) && (sp < d + clampedSize);
+                if (!overlap)
+                {
+                    std::memcpy(d, sp, clampedSize);
+                    return;
+                }
+            }
+        }
+        // PS2X_RPC_COPYLOG=1 (default OFF): name the copies that still take the byte loop.
+        static const bool s_copyLog = [] { const char *e = std::getenv("PS2X_RPC_COPYLOG"); return e && e[0] && e[0] != '0'; }();
+        if (s_copyLog)
+        {
+            static unsigned n = 0;
+            if (++n <= 12u)
+                std::fprintf(stderr, "[rpc:copy] slow path #%u dst=0x%08x src=0x%08x size=%zu dOff=0x%x sOff=0x%x dScr=%d sScr=%d\n",
+                             n, dst, src, clampedSize, dOff, sOff, int(dScr), int(sScr));
+        }
+    }
     for (size_t i = 0; i < clampedSize; ++i)
     {
         const uint32_t dstAddr = dst + static_cast<uint32_t>(i);

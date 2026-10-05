@@ -189,11 +189,23 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+        // cont.230 PS2X_VU1_KICKEAGER: the packet was copied + tag-walked at issue; only the
+        // PATH1 clock (streamedBytes, 16 bytes per 2 credits) remains before it is submitted.
+        bool eagerDone = false;
+        uint32_t streamedBytes = 0;
     };
 
     static constexpr uint32_t kFmacLatency = 4u;
     static constexpr uint32_t kAccForwardLatency = 1u;
-    static constexpr uint32_t kMaxFlagEntries = 8u;
+    // ★★ cont.216: 8 was sized for the INTERPRETER, which retires at the top of every pair and so
+    // never holds more than ~kFmacLatency entries. The block driver replays a whole block's clip +
+    // MAC entries in one pass, so the live set is bounded by the block length, not the latency --
+    // and a full array made freeSlot() return -1, which HALTED the guest program (reported as a
+    // bogus "reserved" instruction). PCSX2 has no such failure mode: its MAC flag history is a
+    // rolling 4-entry ring indexed by cycle (`VU->macflag[VU->cycle & 3]`, VUops.cpp), so overflow
+    // is not an error condition there either. 16 covers kMaxBlockPairs(8) of block entries plus a
+    // full latency window of incoming ones; the masks are uint32_t, so up to 32 is free.
+    static constexpr uint32_t kMaxFlagEntries = 16u;
     static constexpr uint32_t kMaxPendingStores = 8u;
     static constexpr uint32_t kMaxPendingVfWrites = 16u;
     static constexpr uint32_t kMaxPendingViWrites = 8u;
@@ -293,6 +305,10 @@ private:
     int32_t readBranchVi(uint8_t reg) const;
     void recordViWriteForBranch(uint8_t reg, int32_t oldValue);
     void reportReservedInstruction(bool upper, uint32_t instruction);
+    // cont.216: a full pipeline array is a CAPACITY limit of our model, not a guest fault -- report
+    // it as such instead of through a 0xFFFFFFF* sentinel in reportReservedInstruction's
+    // `instruction` field, which prints exactly like a garbage decode.
+    void reportPipelineFull(const char *which);
     float broadcast(const float *vf, uint8_t bc);
 };
 

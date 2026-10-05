@@ -1,0 +1,4 @@
+// ps2xRuntime shim for PCSX2's Gif.h: the enums microVU passes to the GIF unit.
+#pragma once
+enum GIF_PATH { GIF_PATH_1 = 0, GIF_PATH_2 = 1, GIF_PATH_3 = 2 };
+enum GIF_TRANSFER_TYPE { GIF_TRANS_INVALID = 0x000, GIF_TRANS_XGKICK = 0x100, GIF_TRANS_MTVU = 0x200, GIF_TRANS_DIRECT = 0x301, GIF_TRANS_DIRECTHL = 0x401, GIF_TRANS_DMA = 0x502, GIF_TRANS_FIFO = 0x602 };

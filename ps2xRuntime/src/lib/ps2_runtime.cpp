@@ -1,19 +1,29 @@
 #include "ps2_runtime.h"
+#include "ps2_shutdown.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_cpu_backend.h" // cont.232: ps2xGsPresentSourceFresh (presenter cadence)
+#include "ipu/ps2x_ipu.h"              // cont.245: the PCSX2 IPU port
+#include "ps2_user_dir.h"                // Stage 1 item 6.4: the user-state directory
+#include "ps2_debug_panel.h"             // cont.232: g_ps2xDebugUiVisible (the lazy presenter loop)
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_pipe_capture.h"
+#include "runtime/ps2_gs_pipeline.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "runtime/ps2_pad.h"       // rumble: PSPadBackend::pumpVibration (main thread)
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <fstream>
 #include <algorithm>
@@ -49,6 +59,66 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
+// ★★★ cont.332c PS2X_WINDOW_SCALE (default 1 = today's 640x448 window): open the window at N times
+// the guest's display size. The draw already aspect-fits to GetScreenWidth/Height and the window is
+// resizable, so this only chooses the starting size -- but without it nothing can SHOW a
+// higher-resolution present, because the window is exactly one guest pixel per host pixel.
+static int ps2xWindowScale()
+{
+    static const int s = []
+    {
+        const char *e = std::getenv("PS2X_WINDOW_SCALE");
+        const int v = (e && e[0]) ? std::atoi(e) : 1;
+        return v < 1 ? 1 : (v > 4 ? 4 : v);
+    }();
+    return s;
+}
+// ★★ cont.332c PS2X_WINDOW_FILTER (default OFF = raylib's default POINT filter, i.e. what every
+// screenshot in this project so far shows): bilinear on the window blit. Only matters when the
+// window is larger than the presented image -- with PS2X_GS_PRESENT_HIRES at a matching scale the
+// blit is 1:1 and this changes nothing.
+// ★★★★ cont.332d PS2X_WINDOW_ASPECT (default ON = the CORRECT shape; "=0" restores the old
+// pixel-square fit): draw the presented frame at the aspect the DISPLAY registers imply instead of
+// at the framebuffer's own width:height. The CRTC magnifies the source across a fixed raster, so
+// this game's 512x511 display belongs in the same 4:3 rect a 640x512 one would -- presenting it 1:1
+// made every character ~33% too narrow, which is a bigger visual error than the resolution it was
+// being rendered at. ps2xGsPresentAspect() does the register maths (PCSX2 GSState.cpp
+// VideoModeOffsets / VideoModeDividers).
+// cont.332f: it also takes an EXPLICIT ratio now -- "0" off, unset/"1" = derive it from the DISPLAY
+// registers (the default), and anything > 1.1 = that aspect, e.g. 1.7778 for the widescreen hack
+// (the game's own horizontal FOV has to be widened to match, or the picture is merely stretched:
+// game-side LOTR_WIDESCREEN).
+// cont.356: no longer static -- the GL 2D/HUD counter-scale needs the PRESENTED ratio, and it has
+// to be THE SAME value the window fit uses. A second env read in the device would be a second
+// place stating the ratio, which is exactly how these drift apart.
+double ps2xWindowAspect()
+{
+    static const double a = []
+    {
+        const char *e = std::getenv("PS2X_WINDOW_ASPECT");
+        if (!e || !e[0])
+            return 1.0;
+        const double v = std::atof(e);
+        if (v > 1.1)
+            return v;
+        return (e[0] == '0') ? 0.0 : 1.0;
+    }();
+    return a;
+}
+static bool ps2xWindowFilter()
+{
+    static const bool f = []
+    { const char *e = std::getenv("PS2X_WINDOW_FILTER"); return e && e[0] && e[0] != '0'; }();
+    return f;
+}
+// ★★★★ cont.332c: the hi-res present texture (PS2X_GS_PRESENT_HIRES). Owned by the presenter
+// thread, created lazily at the scene resolution the GL device reports and recreated if it changes.
+// Kept beside the 640x448 path rather than replacing it: the display-sized buffer still feeds the
+// present cache, field presentation and PS2X_GS_PRESENT_SAVE.
+static Texture2D s_hiresTex{};
+static bool s_hiresTexValid = false;
+static uint32_t s_hiresTexW = 0, s_hiresTexH = 0;
+static bool s_hiresLive = false; // the last UploadFrame had a hi-res frame to show
 struct ElfHeader
 {
     uint32_t magic;
@@ -327,6 +397,8 @@ namespace
         return absolute.lexically_normal();
     }
 
+    std::filesystem::path defaultMcRoot(const std::filesystem::path &elfDirectory); // defined below
+
     PS2Runtime::IoPaths &runtimeIoPaths()
     {
         static PS2Runtime::IoPaths paths = []()
@@ -337,7 +409,10 @@ namespace
             defaults.elfDirectory = ec ? std::filesystem::path(".") : cwd.lexically_normal();
             defaults.hostRoot = defaults.elfDirectory;
             defaults.cdRoot = defaults.elfDirectory;
-            defaults.mcRoot = defaults.elfDirectory / "mc0";
+            // The same resolution as after loadELF, not `<cwd>/mc0`: initialize() resets the IOP, whose
+            // mcserv reset calls sceMcInit -> ensureMcRootExists BEFORE configureIoPathsFromElf runs, so a
+            // cwd default left empty mc0/ mc1/ in whatever folder the game was launched from.
+            defaults.mcRoot = defaultMcRoot(defaults.elfDirectory);
             return defaults;
         }();
 
@@ -373,7 +448,8 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+// Returns true when a NEW frame was latched and uploaded this call (cont.232: the lazy loop's draw cue).
+static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -387,7 +463,29 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+    // ★ cont.232 PS2X_GS_PRESENT_ONFLIP (default ON; "=0" restores the per-vsync-tick latch): the
+    // presenter decoded + uploaded on EVERY guest vsync tick (50 Hz, i.e. at whatever rate this loop
+    // ran, ~30-40 Hz) although the frame-complete copy it renders changes once per guest FRAME
+    // (~8 fps in the level): ~3.5 presents and two field decodes per guest frame, each with a 4 MB
+    // VRAM snapshot copy, on a fifth thread over four busy cores -- with the presenter dead the level
+    // ran ~15% faster (cont.231 §12). Now a fresh frame-complete copy (the flip snapshot, or the
+    // per-Sync capture) is presented ONCE, when it arrives; the per-tick cadence remains only while
+    // the copy is stale (Present() then reads live VRAM, which does change between ticks). The
+    // window loop still redraws the last texture every iteration (input pump, resize, debug UI).
+    static const bool s_presentOnFlip = []
+    { const char *e = std::getenv("PS2X_GS_PRESENT_ONFLIP"); return !(e && e[0] == '0'); }();
+    static uint64_t s_lastSourceSeq = 0u;
+    if (s_presentOnFlip && s_hasLatchedInitialFrame)
+    {
+        uint64_t seq = 0u;
+        if (ps2xGsPresentSourceFresh(seq))
+        {
+            needsLatch = seq != s_lastSourceSeq;
+            if (needsLatch)
+                s_lastSourceSeq = seq;
+        }
+    }
     if (needsLatch)
     {
         rt->gs().latchHostPresentationFrame();
@@ -398,7 +496,35 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-        return;
+        return false;
+    }
+
+    // ★★★★ cont.332c: if the GL renderer latched a scene-resolution frame, show THAT. The
+    // display-sized path below still runs (it owns `width`/`height`, the present cache and every
+    // other consumer); this only redirects what the window blit samples.
+    s_hiresLive = false;
+    {
+        static std::vector<uint8_t> s_hiresPixels;
+        uint32_t hw = 0u, hh = 0u;
+        if (ps2xGsTakeHiresPresentFrame(s_hiresPixels, hw, hh) && hw != 0u && hh != 0u)
+        {
+            if (!s_hiresTexValid || s_hiresTexW != hw || s_hiresTexH != hh)
+            {
+                if (s_hiresTexValid)
+                    UnloadTexture(s_hiresTex);
+                Image im = GenImageColor(static_cast<int>(hw), static_cast<int>(hh), BLANK);
+                s_hiresTex = LoadTextureFromImage(im);
+                UnloadImage(im);
+                s_hiresTexValid = true;
+                s_hiresTexW = hw;
+                s_hiresTexH = hh;
+                if (ps2xWindowFilter())
+                    SetTextureFilter(s_hiresTex, TEXTURE_FILTER_BILINEAR);
+                std::fprintf(stderr, "[present:hires] texture %ux%u\n", hw, hh);
+            }
+            UpdateTexture(s_hiresTex, s_hiresPixels.data());
+            s_hiresLive = true;
+        }
     }
 
     s_scratch.clear();
@@ -422,7 +548,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
         s_hasUploadedFrame = true;
-        return;
+        return true;
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -475,7 +601,23 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+    return true;
 }
+
+// ★ cont.326: the rasterizer unit is compiled with AVX2 (PS2X_RASTER_AVX2, CMake); refuse a host without it with a
+// message instead of a SIGILL. A static initializer: it runs before main(), so before any backend object exists.
+#if defined(PS2X_RASTER_AVX2) && (defined(__x86_64__) || defined(__i386__))
+static const bool s_rasterAvx2Checked = []
+{
+    __builtin_cpu_init();
+    if (!__builtin_cpu_supports("avx2"))
+    {
+        std::fprintf(stderr, "[runtime] this build's CPU rasterizer needs AVX2 (PS2X_RASTER_AVX2=ON); rebuild with -DPS2X_RASTER_AVX2=OFF\n");
+        std::abort();
+    }
+    return true;
+}();
+#endif
 
 PS2Runtime::PS2Runtime()
 {
@@ -544,6 +686,10 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
+            // Retire streams BEFORE the device: CloseAudioDevice() uninits AUDIO.System.lock
+            // (raudio.c), and UnloadAudioBuffer -> UntrackAudioBuffer locks it, so unloading
+            // afterwards would take a destroyed mutex.
+            m_audioBackend.streamStopAll();
             CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
         }
@@ -621,10 +767,15 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
+    m_gifArbiter.setDrainDoneFn([this] { m_gs.endPacket(); }); // cont.230 PS2X_GS_DRAWRUN
+    ps2gs::setParseGs(&m_gs); // rotk row 253: the GS the PS2X_GS_SPLIT parse thread feeds
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // cont.317 stage 2: on the pipeline thread the scheduler's current context is the
+                                     // EE's live state -- read FBRST from the main context (one ctc2 in this game) and
+                                     // do not write VPU_STAT back (nothing reads it: no cfc2 in the generated code).
+                                     R5900Context *cpuContext = (!ps2gs::threaded() && m_eeScheduler) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
@@ -636,13 +787,17 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     if (!ps2gs::threaded())
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // cont.317 stage 2: on the pipeline thread the scheduler's current context is the
+                                     // EE's live state -- read FBRST from the main context (one ctc2 in this game) and
+                                     // do not write VPU_STAT back (nothing reads it: no cfc2 in the generated code).
+                                     R5900Context *cpuContext = (!ps2gs::threaded() && m_eeScheduler) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
@@ -654,6 +809,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     if (!ps2gs::threaded())
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -676,6 +832,9 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
             return false;
         }
+        // cont.245: the PCSX2 IPU (PS2X_IPU, default on) binds its DMA to guest memory here.
+        if (ps2x_ipu::enabled())
+            ps2x_ipu::init(&m_memory, m_memory.getRDRAM(), m_memory.getScratchpad());
 
         if (!syncCoreSubsystems())
         {
@@ -694,10 +853,47 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        // cont.231 PS2X_WINDOW_ALWAYS_RUN (default ON; "=0" restores raylib's pause): raylib parks the
+        // main loop in glfwWaitEvents() while the window is MINIMIZED (no input pump, no presents) unless
+        // FLAG_WINDOW_ALWAYS_RUN is set. The guest threads keep running regardless, so a minimized run
+        // silently loses its presenter (three cont.231 timing runs did, and only a gdb backtrace of the
+        // main thread -- poll < glfwWaitEventsX11 < PollInputEvents < EndDrawing -- said why). An
+        // emulator should keep presenting when minimized; it also keeps measurements comparable.
+        static const bool s_alwaysRun = []
+        { const char *e = std::getenv("PS2X_WINDOW_ALWAYS_RUN"); return !(e && e[0] == '0'); }();
+        // rumble branch (row 224): on raylib's SDL platform, SDL DROPS gamepad events while the window
+        // is unfocused (SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS defaults to 0); GLFW polled the pad
+        // regardless of focus. The user's first SDL run had a dead pad at the language screen. SDL reads
+        // hints from the environment at SDL_Init, so set it here, before InitWindow, and never override a
+        // value the user exported. Harmless on GLFW (nothing reads it).
+        setenv("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1", 0);
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (s_alwaysRun ? FLAG_WINDOW_ALWAYS_RUN : 0u));
+        InitWindow(HOST_WINDOW_WIDTH * ps2xWindowScale(), HOST_WINDOW_HEIGHT * ps2xWindowScale(),
+                   title);
+        // PS2X_AUDIO (default ON since cont.332q; "=0" skips the host audio device). It was default OFF
+        // from cont.245 on the premise below -- "the game has no audible output yet" -- which stopped being
+        // true at cont.282: the game drives a real 44.1 kHz PCM stream sink (ps2_audio.cpp streamOpen /
+        // streamPushAdpcm), and a fight replay opens 5 streams. PCSX2 likewise brings its audio backend up
+        // by default (SPU2 + cubeb), so an emulator that boots silent is the odd one out.
+        // ⚠ The original reason to default it off is REAL and unfixed, just rarer: raylib's InitAudioDevice
+        // runs on THIS thread right after the window exists. When the desktop's audio server is degraded (2026-09-05: the laptop's SOF DSP failed to
+        // boot after a resume, PipeWire's sink sat in an error state, `pactl list sinks` segfaulted) the
+        // PulseAudio connect wait inside miniaudio (ma_wait_for_pa_stream_to_connect__pulse: loop until
+        // READY or FAILED) hangs for ~30 s, the window answers no ping and GNOME shows "not responding".
+        // `PS2X_AUDIO=0` is the escape hatch for exactly that: it skips the device and the audio backend
+        // simply reports not-ready. If a launch ever hangs ~30 s with the window unresponsive, try it.
+        static const bool s_audio = []
+        { const char *e = std::getenv("PS2X_AUDIO"); return !(e && e[0] == '0'); }();
+        if (s_audio)
+        {
+            InitAudioDevice();
+            m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        }
+        else
+        {
+            std::fprintf(stderr, "[audio] host audio device NOT opened (PS2X_AUDIO=0; the game is silent)\n");
+            m_audioBackend.setAudioReady(false);
+        }
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -720,9 +916,25 @@ bool PS2Runtime::initialize(const char *title)
     return false;
 }
 
+// cont.232: defined in Kernel/EeScheduler.cpp -- the console's boot-time video region.
+void ps2xSetDefaultVideoRegion(bool pal) noexcept;
+
 bool PS2Runtime::loadELF(const std::string &elfPath)
 {
     configureIoPathsFromElf(elfPath);
+    {
+        // Region from the disc ID in the ELF name (SLES/SCES/SLED = Europe = PAL; SLUS/SCUS/SLPS/SLPM/SCPS/
+        // SLKA = NTSC), the same inference an OSD makes from its BIOS region. PS2X_REGION overrides.
+        std::string base = elfPath;
+        const size_t slash = base.find_last_of("/\\");
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        for (char &c : base) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        const bool pal = base.rfind("SLES", 0) == 0 || base.rfind("SCES", 0) == 0 || base.rfind("SLED", 0) == 0 ||
+                         base.rfind("SCED", 0) == 0 || base.rfind("TCES", 0) == 0;
+        ps2xSetDefaultVideoRegion(pal);
+        std::fprintf(stderr, "[vblank] ELF %s -> console region default %s (PS2X_REGION=PAL|NTSC overrides)\n",
+                     base.c_str(), pal ? "PAL 50 Hz" : "NTSC 59.94 Hz");
+    }
 
     std::ifstream file(elfPath, std::ios::binary);
     if (!file)
@@ -979,6 +1191,53 @@ const PS2Runtime::IoPaths &PS2Runtime::getIoPaths()
     return runtimeIoPaths();
 }
 
+namespace
+{
+    // ★ cont.346p PS2X_MC_ROOT=<dir>: the directory that CONTAINS `mc0/` and `mc1/`. Unset = the ELF's
+    // own directory, which is exactly the pre-346p behaviour, so nothing changes for anyone who does
+    // not set it.
+    // Why it exists: the ELF now lives INSIDE `gamefiles/` so a player can drop their whole disc into
+    // one folder (user, 2026-09-19). Memory cards must not be FORCED to follow the ELF, because the
+    // two-card test harness gives each mirror its own `mc0` while both share one `gamefiles/` -- and
+    // if the card root followed the ELF, every mirror would resolve to the same card and the
+    // save-present vs fresh-card distinction (a standing validation rule) would silently collapse.
+    std::filesystem::path mcRootFromEnv()
+    {
+        const char *e = std::getenv("PS2X_MC_ROOT");
+        if (!e || !e[0])
+        {
+            return {};
+        }
+        return std::filesystem::path(e) / "mc0";
+    }
+
+    // ★ cont.346q (and the default again since 2026-10-01, user; 2026-09-25..10-01 it was the platform
+    // config folder -- ps2_user_dir.h): the directory holding the RUNNING EXECUTABLE. User state -- memory cards now, the
+    // settings layer later -- lives in `<exe dir>/config/`, which is the "portable" convention both
+    // comparable recompilation projects support (Zelda 64: Recompiled and Unleashed Recompiled both
+    // ship a `portable.txt` that does exactly this).
+    // Why not beside the ELF: `gamefiles/` is the player's DISC DUMP -- replaceable and re-droppable.
+    // People re-dump when a rip was bad, and the natural way is to wipe the folder and re-copy, which
+    // would take their saves with it. Saves have a different lifetime, so they get a different home.
+    // Resolution order: PS2X_MC_ROOT (explicit) -> the user directory (<exe dir>/config, or
+    // PS2X_USER_DIR; ps2_user_dir.h) -> the ELF's directory
+    // (the pre-346q behaviour, kept as a last resort when no user directory can be determined).
+    std::filesystem::path defaultMcRoot(const std::filesystem::path &elfDirectory)
+    {
+        const std::filesystem::path fromEnv = mcRootFromEnv();
+        if (!fromEnv.empty())
+        {
+            return fromEnv;
+        }
+        const std::filesystem::path userDir = ps2x::userdir::directory();
+        if (!userDir.empty())
+        {
+            return userDir / "mc0";
+        }
+        return elfDirectory / "mc0";
+    }
+}
+
 void PS2Runtime::setIoPaths(const IoPaths &paths)
 {
     IoPaths normalized = paths;
@@ -1004,7 +1263,7 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     }
     if (normalized.mcRoot.empty())
     {
-        normalized.mcRoot = normalized.elfDirectory / "mc0";
+        normalized.mcRoot = normalizeAbsolutePath(defaultMcRoot(normalized.elfDirectory));
     }
 
     runtimeIoPaths() = normalized;
@@ -1021,9 +1280,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 
     if (!paths.elfDirectory.empty())
     {
+        // host: and cdrom: SHOULD follow the ELF -- with the ELF inside gamefiles/ they now point at
+        // the disc content, which is more faithful than pointing at the game folder.
         paths.hostRoot = paths.elfDirectory;
         paths.cdRoot = paths.elfDirectory;
-        paths.mcRoot = paths.elfDirectory / "mc0";
+        paths.mcRoot = defaultMcRoot(paths.elfDirectory);
     }
 
     setIoPaths(paths);
@@ -1068,6 +1329,174 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 {
     return replaceFunction(address, func);
+}
+
+// ---- PS2X_DISPATCH_UNWIND_FIX (cont.249, default ON; `=0` restores the old behaviour for A/B):
+// propagate a checkpoint unwind through dispatchGuestBranch instead of mistaking it for a completed
+// call whose callee left ctx->pc untouched. See dispatchGuestBranch(). Validated 2026-09-06: the same
+// 600 s play run that died at `source=0x15bbd8 target=0x15a320` with the fix off survived the identical
+// event with it on, and reached 1.8x as many hero updates.
+static const bool s_dispatchUnwindFix = []
+{
+    const char *e = std::getenv("PS2X_DISPATCH_UNWIND_FIX");
+    return !(e && e[0] == '0');
+}();
+
+// ---- PS2X_WRITE_WATCH (cont.248): see ps2TraceGuestWrite in ps2_runtime.h.
+uint32_t g_ps2WriteWatchAddr = []
+{
+    const char *e = std::getenv("PS2X_WRITE_WATCH");
+    if (!e || !e[0])
+    {
+        return 0u;
+    }
+    return static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) & 0x01FFFFFFu;
+}();
+
+uint32_t g_ps2WriteWatchLen = []
+{
+    const char *e = std::getenv("PS2X_WRITE_WATCH_LEN");
+    const uint32_t v = (e && e[0]) ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 4u;
+    return v == 0u ? 4u : v;
+}();
+
+uint32_t g_ps2WriteWatchPc = []
+{
+    const char *e = std::getenv("PS2X_WRITE_WATCH_PC");
+    return (e && e[0]) ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+}();
+unsigned long g_ps2DispatchSeq = 0;
+
+namespace
+{
+struct WriteWatchHit
+{
+    unsigned long seq = 0;
+    unsigned long dispatch = 0;
+    uint32_t pc = 0, sp = 0, ra = 0, addr = 0, size = 0;
+    uint64_t lo = 0;
+    const char *op = "";
+};
+WriteWatchHit g_writeWatchRing[256];
+unsigned long g_writeWatchSeq = 0;
+
+// cont.249: the ring rolls over long before a crash (29 M hits in a 10-minute run), so it cannot answer
+// "who last wrote THIS word". Keep a per-word last-writer slot for the whole watched range instead: one
+// entry per guest word, overwritten in place, so the crash dump can name the writer of the exact saved-ra
+// slot the failing `jr ra` read -- regardless of how long ago it was written.
+std::vector<WriteWatchHit> g_writeWatchWords;
+
+// Sized once from the flags above (same TU, so those initializers have already run).
+const bool g_writeWatchWordsInit = []
+{
+    if (g_ps2WriteWatchAddr != 0u && g_ps2WriteWatchLen <= 0x100000u)
+    {
+        g_writeWatchWords.assign((g_ps2WriteWatchLen + 3u) / 4u, WriteWatchHit{});
+    }
+    return true;
+}();
+
+void ps2WriteWatchRecordWords(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                              const char *op, const R5900Context *ctx, unsigned long seq);
+} // namespace
+
+void ps2WriteWatchHit(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                      const char *op, const R5900Context *ctx)
+{
+    (void)rdram;
+    (void)valueHi;
+    WriteWatchHit &h = g_writeWatchRing[g_writeWatchSeq % 256];
+    h.seq = ++g_writeWatchSeq;
+    ps2WriteWatchRecordWords(guestAddr, size, valueLo, valueHi, op, ctx, h.seq);
+    h.dispatch = g_ps2DispatchSeq;
+    h.pc = ctx ? ctx->pc : 0u;
+    h.sp = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u;
+    h.ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
+    h.addr = guestAddr;
+    h.size = size;
+    h.lo = valueLo;
+    h.op = op;
+    if (g_writeWatchSeq <= 8 || (g_ps2WriteWatchPc != 0u && h.pc == g_ps2WriteWatchPc && g_writeWatchSeq % 64 == 0))
+    {
+        std::fprintf(stderr, "[writewatch] #%lu d%lu %s 0x%x size=%u value=0x%llx at guest pc=0x%x sp=0x%x ra=0x%x\n",
+                     h.seq, h.dispatch, op, guestAddr, size, (unsigned long long)valueLo, h.pc, h.sp, h.ra);
+    }
+}
+
+namespace
+{
+void ps2WriteWatchRecordWords(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                              const char *op, const R5900Context *ctx, unsigned long seq)
+{
+    if (g_writeWatchWords.empty())
+    {
+        return;
+    }
+    const uint32_t base = g_ps2WriteWatchAddr;
+    const uint32_t a = guestAddr & 0x01FFFFFFu;
+    for (uint32_t off = 0; off < size; off += 4u)
+    {
+        const uint32_t w = a + off;
+        if (w < base || w >= base + g_ps2WriteWatchLen)
+        {
+            continue;
+        }
+        WriteWatchHit &e = g_writeWatchWords[(w - base) / 4u];
+        e.seq = seq;
+        e.dispatch = g_ps2DispatchSeq;
+        e.pc = ctx ? ctx->pc : 0u;
+        e.sp = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u;
+        e.ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
+        e.addr = w;
+        e.size = size;
+        e.lo = (off < 8u) ? (valueLo >> (off * 8u)) : (valueHi >> ((off - 8u) * 8u));
+        e.op = op;
+    }
+}
+} // namespace
+
+// Name the last writer of every word in [from, to) -- called with the crashing frame's range so the log
+// says who put the bogus value in the saved-ra slot.
+void ps2WriteWatchDumpRange(uint32_t from, uint32_t to)
+{
+    if (g_writeWatchWords.empty())
+    {
+        return;
+    }
+    const uint32_t base = g_ps2WriteWatchAddr;
+    std::fprintf(stderr, "[writewatch] last writer of each word in [0x%x, 0x%x):\n", from, to);
+    for (uint32_t w = from & ~3u; w < to; w += 4u)
+    {
+        if (w < base || w >= base + g_ps2WriteWatchLen)
+        {
+            continue;
+        }
+        const WriteWatchHit &e = g_writeWatchWords[(w - base) / 4u];
+        if (e.seq == 0u)
+        {
+            std::fprintf(stderr, "[writewatch]   0x%x: never written while watched\n", w);
+            continue;
+        }
+        std::fprintf(stderr, "[writewatch]   0x%x = 0x%08x  <- #%lu d%lu %s size=%u at guest pc=0x%x sp=0x%x ra=0x%x\n",
+                     w, static_cast<uint32_t>(e.lo), e.seq, e.dispatch, e.op, e.size, e.pc, e.sp, e.ra);
+    }
+}
+
+void ps2WriteWatchDump()
+{
+    if (g_ps2WriteWatchAddr == 0u)
+    {
+        return;
+    }
+    std::fprintf(stderr, "[writewatch] watched [0x%x, +0x%x): %lu writes; the last ones (oldest first):\n",
+                 g_ps2WriteWatchAddr, g_ps2WriteWatchLen, g_writeWatchSeq);
+    const unsigned long from = g_writeWatchSeq > 256 ? g_writeWatchSeq - 256 + 1 : 1;
+    for (unsigned long q = from; q <= g_writeWatchSeq; ++q)
+    {
+        const WriteWatchHit &h = g_writeWatchRing[(q - 1) % 256];
+        std::fprintf(stderr, "[writewatch]   #%lu d%lu %s 0x%x size=%u value=0x%llx at guest pc=0x%x sp=0x%x ra=0x%x\n",
+                     h.seq, h.dispatch, h.op, h.addr, h.size, (unsigned long long)h.lo, h.pc, h.sp, h.ra);
+    }
 }
 
 bool PS2Runtime::hasFunction(uint32_t address) const
@@ -1152,6 +1581,14 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        GuestBranchKind kind,
                                        const char *debugName)
 {
+    // cont.248: a `jr $ra` with ra == 0 is the runtime's own completion sentinel (top-level invocations and
+    // host-pumped chains return to 0), not a missing target -- under PS2X_STRICT_RETURN_DIAGNOSTICS it used to
+    // spend the one-shot report at boot, hiding the first REAL bad return. Nothing to report for it.
+    if (kind == GuestBranchKind::Return && targetPc == 0u)
+    {
+        ctx->pc = targetPc;
+        return;
+    }
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
 
@@ -1299,6 +1736,16 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 
     if (policy == MissingFunctionPolicy::Stop)
     {
+        // 2026-10-02: in the runner (ps2_shutdown.h) a missing target ENDS the process with exit 3: the
+        // guest state is already corrupt, and continuing ran away in memory until the machine locked up.
+        if (ps2x::shutdown::fatalMissingTarget() && firstReport)
+        {
+            std::fprintf(stderr, "[runtime:fatal] unrecoverable missing branch target 0x%x (from 0x%x, %s) -- "
+                                 "stopping, exit %d\n",
+                         targetPc, sourcePc, debugName ? debugName : "?", ps2x::shutdown::kExitMissingTarget);
+            ps2x::shutdown::setExitCode(ps2x::shutdown::kExitMissingTarget);
+            ps2x::shutdown::armWatchdog("missing branch target");
+        }
         requestStop();
     }
 }
@@ -1333,7 +1780,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    // cont.317 (cont.): ONE table walk per call. hasFunction() and lookupFunction() each recomputed
+    // the slot; the lookup's dispatch-history push is kept, after the found check, as before.
+    RecompiledFunction targetFn = nullptr;
+    {
+        uint32_t slot = 0u;
+        if (generatedFunctionTableSlot(targetPc, slot))
+            targetFn = g_ps2RecompiledFunctionTable[slot];
+    }
+    if (targetFn == nullptr)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1353,9 +1808,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
         return false;
     }
-
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    pushDispatchPc(targetPc);
     const uint32_t entryPc = ctx->pc;
+    // cont.249: a checkpoint inside the nested call ABANDONS the chain and unwinds to the run loop
+    // (see the block comment atop EeScheduler.cpp). Sample the checkpoint epoch across the call so
+    // the "ctx->pc == entryPc" test below can tell the two cases apart.
+    const uint64_t epochBefore = m_eeScheduler ? m_eeScheduler->checkpointEpoch() : 0ull;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1365,6 +1823,38 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (ctx->pc == entryPc)
     {
+        // Two very different situations land here:
+        //  (a) the target is a game OVERRIDE hook that never touches ctx->pc -- it ran, and the
+        //      caller must continue at its fallthrough. This is the case the line was written for.
+        //  (b) a checkpoint fired at/below this call and unwound the host stack with ctx->pc left
+        //      on an in-flight target that HAPPENS to equal this call's target -- which only occurs
+        //      when the same address is in flight at two recursion depths (the LOTR scene-graph walk
+        //      0x15a320 <-> 0x159a30 does exactly this). Treating (b) as a fallthrough resumes the
+        //      OUTER caller inline while sp still belongs to the INNER frame; the caller then runs
+        //      its epilogue on a foreign frame and `jr ra` loads a saved s-register as its return
+        //      address. That is the "EE scheduler missing-target" failure.
+        const bool unwound = m_eeScheduler && m_eeScheduler->checkpointEpoch() != epochBefore;
+        if (unwound)
+        {
+            static std::atomic<unsigned long> s_swallowed{0};
+            const unsigned long n = ++s_swallowed;
+            if (n <= 16u || (n & 0xFFFu) == 0u)
+            {
+                std::fprintf(stderr,
+                             "[dispatch:swallowed-unwind] #%lu %s target=0x%x source=0x%x fallthrough=0x%x "
+                             "sp=0x%x ra=0x%x%s\n",
+                             n, debugName ? debugName : "?", targetPc, sourcePc, fallthroughPc,
+                             static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29])),
+                             static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])),
+                             s_dispatchUnwindFix ? " [propagated]" : " [treated as fallthrough]");
+            }
+            if (s_dispatchUnwindFix)
+            {
+                // The callee did not complete: leave ctx->pc where the checkpoint put it and let the
+                // run loop re-dispatch it, exactly as it does for every other unwound chain.
+                return false;
+            }
+        }
         ctx->pc = fallthroughPc;
     }
 
@@ -1397,7 +1887,49 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         return;
     }
 
-    m_vu0.reset();
+    // ★★ PS2X_VU0_SLOW2=1 (default OFF) -- MEASUREMENT knob, and BIT-EXACT unlike an ablation.
+    // cont.250 section 8: VU0 cannot be sized by ablating it, because the guest CONSUMES its output
+    // (VCALLMS computes matrices/collision the game reads back), so falsifying the result changes
+    // control flow instead of removing work -- the PS2X_VU0_ABLATE attempt produced runs that were
+    // not work-matched (hero updates 1245/2636 vs a reproducible 3763/3797) and was withdrawn.
+    // This doubles VU0's WORK while leaving every architectural effect identical: the production
+    // pass below runs FIRST and is authoritative, then a throwaway pass re-runs the same program
+    // from the same pre-call input state on a SCRATCH COPY of VU0 data memory, and its results are
+    // discarded. Safe because (a) XGKICK is gated to Unit::VU1 (ps2_vu1_core.cpp), so VU0 cannot
+    // queue GS packets, and (b) nothing outside this function reads m_vu0.state(), which the next
+    // call rebuilds via copyVu0ContextToState()'s memset anyway.
+    // Read the SLOPE: if doubling VU0 costs X ms/frame, VU0 costs ~X ms/frame. The 4 KB scratch
+    // memcpy is charged to the doubled side, so the slope is an UPPER BOUND on VU0's true cost.
+    static const bool s_vu0Slow2 = []
+    { const char *e = std::getenv("PS2X_VU0_SLOW2"); return e && e[0] && e[0] != '0'; }();
+    if (s_vu0Slow2)
+    {
+        const R5900Context savedCtx = *ctx;   // pre-call input state for the throwaway pass
+
+        copyVu0ContextToState(ctx, m_vu0.state());
+        m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
+                      vu0Data, PS2_VU0_DATA_SIZE,
+                      m_gs, &m_memory,
+                      startPC, 0u, ctx->vu0_itop, 4096);
+        copyVu0StateToContext(m_vu0.state(), ctx);   // authoritative result, already committed
+
+        static thread_local uint8_t scratchVu0Data[PS2_VU0_DATA_SIZE];
+        std::memcpy(scratchVu0Data, vu0Data, PS2_VU0_DATA_SIZE);
+        copyVu0ContextToState(&savedCtx, m_vu0.state());
+        m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
+                      scratchVu0Data, PS2_VU0_DATA_SIZE,
+                      m_gs, &m_memory,
+                      startPC, 0u, savedCtx.vu0_itop, 4096);
+        // results deliberately NOT copied back -- this pass exists only to burn the same work again
+        return;
+    }
+
+    // No wholesale reset() per VCALLMS (cont.158d perf): copyVu0ContextToState() below
+    // rebuilds the full architectural state from the EE context (it memsets the state
+    // struct itself), and execute() runs resetScheduler() — reset() here was 100%
+    // redundant work at math-library call rates, and its m_cycle=0 broke the cycle
+    // monotonicity the scheduler bookkeeping now relies on. PCSX2 parity: vu0ExecMicro
+    // (VU0micro.cpp) does not reset VU0 on VCALLMS either — flag/cycle sync + start.
     copyVu0ContextToState(ctx, m_vu0.state());
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
@@ -2301,6 +2833,11 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 
 void PS2Runtime::run()
 {
+    if (ps2pipe::benchRun(*this)) // cont.317 pipeline oracle: replay a capture and exit
+    {
+        std::fflush(nullptr);
+        _exit(0);
+    }
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
@@ -2321,12 +2858,25 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    if (ps2xWindowFilter())
+        SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR); // cont.332c
 
     std::atomic<bool> gameThreadFinished{false};
 
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ThreadNaming::PinCurrentThreadForRole(ThreadNaming::CpuRole::EE); // cont.230 (auto plan / PS2X_EE_CPUS)
+        {
+            const ThreadNaming::CpuPlan &plan = ThreadNaming::AutoCpuPlan();
+            const char *ee = std::getenv("PS2X_EE_CPUS"), *gs = std::getenv("PS2X_GS_CPUS");
+            std::fprintf(stderr, "[affinity] plan: physicalCores=%u auto=%s EE=%s GS=%s%s\n",
+                         plan.physicalCores,
+                         ThreadNaming::AutoCpuPinEnabled() ? (plan.valid ? "on" : "off(<3 cores)") : "off(PS2X_CPU_PIN=0)",
+                         ee && ee[0] ? ee : (ThreadNaming::AutoCpuPinEnabled() && plan.valid ? plan.ee.c_str() : "-"),
+                         gs && gs[0] ? gs : (ThreadNaming::AutoCpuPinEnabled() && plan.valid ? plan.gs.c_str() : "-"),
+                         (ee && ee[0]) || (gs && gs[0]) ? " (explicit)" : "");
+        }
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2348,6 +2898,7 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        PSPadBackend::pumpVibration(); // rumble: raylib/SDL only on this thread; a no-op until the game sends one
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -2379,9 +2930,55 @@ void PS2Runtime::run()
                                                << std::endl);
             }
         });
+        // cont.232 PS2X_GS_NOPRESENT (default OFF): ABLATION, never a mode -- the main loop only polls
+        // window events and sleeps: no latch/decode, no GL draw or swap, no ImGui overlay, no target-FPS
+        // wait. It is the state a MINIMIZED window used to put the presenter in (cont.231 §12, raylib
+        // parked in glfwWaitEvents) without minimizing, so an alternating pair on one binary measures
+        // what the whole presenter costs the guest. Nothing is shown while it is on.
+        static const bool s_noPresent = []
+        { const char *e = std::getenv("PS2X_GS_NOPRESENT"); return e && e[0] && e[0] != '0'; }();
+        // ★ cont.232 PS2X_GS_PRESENT_LAZY (default ON; "=0" = draw + swap on every iteration, the 404
+        // loop): with presents tied to the flip the loop still drew, swapped and ran the ImGui overlay at
+        // 60 Hz between guest frames, and the §5 ablation (PS2X_GS_NOPRESENT) measured that idle loop at
+        // ~13% of the level's frame rate (five threads over four cores: the main thread's GL driver work,
+        // the overlay, raylib's partial busy-wait). Now an iteration WITHOUT a new frame only polls window
+        // events and sleeps 4 ms; the frame is drawn when a new one was latched, while the overlay is open
+        // (it stays interactive at 60 Hz; it starts hidden, PS2X_DEBUG_UI=1 / F1 opens it), on F1 or a
+        // resize, and at least every 250 ms (expose). The panel itself handles F1, so on an F1 press the
+        // loop draws once to let it toggle.
+        static const bool s_presentLazy = []
+        { const char *e = std::getenv("PS2X_GS_PRESENT_LAZY"); return !(e && e[0] == '0'); }();
+        static std::chrono::steady_clock::time_point s_lastDraw{};
+        if (s_noPresent)
+        {
+            PollInputEvents(); // keep answering the WM (ping/close), as the parked loop did
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            if (WindowShouldClose())
+            {
+                RUNTIME_LOG("[run] window close requested (nopresent), breaking out of loop");
+                requestStop();
+                break;
+            }
+            continue;
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        const bool newFrame = UploadFrame(frameTex, this, presentWidth, presentHeight);
+        if (s_presentLazy && !newFrame && !g_ps2xDebugUiVisible.load(std::memory_order_relaxed) &&
+            !IsKeyPressed(KEY_F1) && !IsWindowResized() &&
+            std::chrono::steady_clock::now() - s_lastDraw < std::chrono::milliseconds(250))
+        {
+            PollInputEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            if (WindowShouldClose())
+            {
+                RUNTIME_LOG("[run] window close requested, breaking out of loop");
+                requestStop();
+                break;
+            }
+            continue;
+        }
+        s_lastDraw = std::chrono::steady_clock::now();
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -2389,16 +2986,50 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // ★★★★ cont.332d: fit by the DISPLAYED aspect, not the framebuffer's pixel count.
+        const double want = ps2xWindowAspect();
+        const float regAspect = ps2xGsPresentAspect();
+        // ★★★★★ cont.356e: a 2D SCREEN is PILLARBOXED, not stretched. The title/menu artwork is
+        // uploaded into the framebuffer during boot and presented from there -- nothing redraws it
+        // per frame, so there is no draw to counter-scale (cont.356d proved a draw-level fix cannot
+        // reach it). Presenting such a frame at the DISPLAY-derived natural aspect keeps the art in
+        // its authored proportions and puts the widescreen bars at the sides, which is the correct
+        // treatment for 4:3 art on a wider screen. Only the explicit-ratio case is overridden; with
+        // no override the two are already equal and this changes nothing.
+        const bool twoDScreen = ps2xGsIs2dScreen() && regAspect > 0.1f && regAspect < 4.0f;
+        const float aspect = twoDScreen
+                                 ? regAspect                         // pillarbox: natural aspect
+                                 : ((want > 1.1)
+                                 ? static_cast<float>(want)          // an explicit ratio (16:9, ...)
+                                 : ((want > 0.0 && regAspect > 0.1f && regAspect < 4.0f)
+                                        ? regAspect                  // derived from DISPLAY
+                                        : (srcWidth / srcHeight)));  // off: pixel-square, as before
+        float dstWidth = screenWidth;
+        float dstHeight = screenWidth / aspect;
+        if (dstHeight > screenHeight)
+        {
+            dstHeight = screenHeight;
+            dstWidth = screenHeight * aspect;
+        }
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        // ★★★★ cont.332c: the hi-res texture carries the same picture at scene resolution, so the
+        // aspect fit above (computed from the GUEST display size) is still the right rectangle --
+        // only the source rect changes.
+        if (s_hiresLive && s_hiresTexValid)
+        {
+            const Rectangle hiSrc{0.0f, 0.0f, static_cast<float>(s_hiresTexW),
+                                  static_cast<float>(s_hiresTexH)};
+            DrawTexturePro(s_hiresTex, hiSrc, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
+        else
+        {
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
@@ -2414,9 +3045,13 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    // 2026-10-02: the join below waited for ever when the EE thread never reached a stop check, so
+    // neither the window's close button nor SIGTERM could end the process. Bound it.
+    ps2x::shutdown::armWatchdog("run loop ended");
     if (gameThread.joinable())
     {
         gameThread.join();
+        ps2gs::shutdown(); // cont.317 stage 2: drain and join the pipeline thread after the EE stops
     }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)

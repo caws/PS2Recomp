@@ -234,7 +234,23 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
-inline void ps2TraceGuestWrite(uint8_t *rdram,
+// cont.248: PS2X_WRITE_WATCH=<guest address> (default unset = off). A software watchpoint on ONE guest word: every
+// generated store (WRITE8..WRITE128) and every runtime Store* that overlaps it is recorded -- the guest pc of the
+// storing instruction (ctx->pc is set before each emitted instruction), sp, ra, the value -- in a 16-entry ring,
+// the first hits printed live and the ring dumped from the EE scheduler's missing-target path. Deterministic and
+// timing-neutral, unlike a gdb hardware watchpoint (one predictable branch per store when unset).
+extern uint32_t g_ps2WriteWatchAddr;
+extern uint32_t g_ps2WriteWatchPc;     // PS2X_WRITE_WATCH_PC: also record every store made by this guest pc (any address)
+extern unsigned long g_ps2DispatchSeq; // the EE scheduler's dispatch counter (stackguard ring), stamped on each hit
+extern uint32_t g_ps2WriteWatchLen;    // PS2X_WRITE_WATCH_LEN (default 4): the watched byte range [addr, addr+len)
+void ps2WriteWatchHit(uint8_t *rdram, uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                      const char *op, const R5900Context *ctx);
+void ps2WriteWatchDump();
+// Names the last writer of every word in [from, to) -- the crash path passes the failing frame.
+void ps2WriteWatchDumpRange(uint32_t from, uint32_t to);
+
+// cont.317: force-inlined -- one predictable branch per guest store, not a call.
+__attribute__((always_inline)) inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
                                uint64_t valueLo,
@@ -242,14 +258,15 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const char *op,
                                const R5900Context *ctx)
 {
-    (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
-    (void)valueHi;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (__builtin_expect(g_ps2WriteWatchAddr != 0u, 0))
+    {
+        const uint32_t a = guestAddr & 0x01FFFFFFu;
+        if ((a < g_ps2WriteWatchAddr + g_ps2WriteWatchLen && g_ps2WriteWatchAddr < a + size) ||
+            (g_ps2WriteWatchPc != 0u && ctx && ctx->pc == g_ps2WriteWatchPc))
+        {
+            ps2WriteWatchHit(rdram, guestAddr, size, valueLo, valueHi, op, ctx);
+        }
+    }
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,

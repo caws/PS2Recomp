@@ -80,6 +80,13 @@ namespace ps2_stubs
         {
             std::string currentDir = "/";
             bool formatted = true;
+            // libmc contract (ps2sdk libmc.h, mcGetInfo): the result read back through mcSync is 0 only when the card is
+            // the SAME card as at the previous mcGetInfo call; the FIRST call after the card was detected reports -1
+            // (a formatted card inserted since the last call) or -2 (an unformatted one). On hardware that first
+            // detection comes from mcman's McDetectCard at boot. Games initialise their card state machine on that
+            // -1/-2: LOTR's load-game page polls sceMcGetInfo until the wrapper (0x14CD30: returns result != 0) sees a
+            // change and hangs forever on a fresh card when every call says 0.
+            bool infoSeen = false;
         };
 
         std::mutex g_mcStateMutex;
@@ -877,7 +884,17 @@ namespace ps2_stubs
                 cardType = kMcTypePs2;
                 freeBlocks = state.formatted ? kMcFreeClusters : 0;
                 format = state.formatted ? kMcFormatted : kMcUnformatted;
-                result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
+                // First mcGetInfo since the card was detected -> "card inserted since the last call" (-1 formatted,
+                // -2 unformatted); afterwards 0 = the same card (its format state is in *format). See McPortState.
+                if (!state.infoSeen)
+                {
+                    state.infoSeen = true;
+                    result = state.formatted ? kMcResultChangedCard : kMcResultNoFormat;
+                }
+                else
+                {
+                    result = kMcResultSucceed;
+                }
             }
 
             setMcCommandResultLocked(kMcCmdGetInfo, result);

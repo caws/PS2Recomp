@@ -1,13 +1,20 @@
 #include "Common.h"
 #include "System.h"
+#include <cstdlib>
+#include <sstream>
+#include "ps2_loadexec.h"
+
+// cont.232: defined in Kernel/EeScheduler.cpp -- the vblank period follows the selected video mode.
+void ps2xSetGsVideoMode(uint32_t interlaced, uint32_t mode) noexcept;
 
 namespace ps2_syscalls
 {
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
-        int videoMode = getRegU32(ctx, 5);  // $a1 - 0=NTSC, 1=PAL, 2=VESA, 3=HiVision
+        int videoMode = getRegU32(ctx, 5);  // $a1 - 0/2=NTSC, 1/3=PAL, 0x50 480p, 0x1A..0x4B VESA (PCSX2 SetGsCrt)
         int frameMode = getRegU32(ctx, 6);  // $a2 - 0=field, 1=frame
+        ps2xSetGsVideoMode(static_cast<uint32_t>(interlaced), static_cast<uint32_t>(videoMode));
 
         if (runtime)
         {
@@ -424,8 +431,16 @@ namespace ps2_syscalls
 
         if (!runtime->hasFunction(handler))
         {
-            setReturnS32(ctx, KE_ERROR);
-            return true;
+            // Row 251: a handler that is not recompiled code -- typically kernel code the game copied into kernel RAM
+            // itself (the SDK's LoadExecPS2 patch puts syscall 0x5B at 0x80075000) -- cannot run here. Answer with the
+            // runtime's own implementation of that syscall rather than KE_ERROR: the patch exists to make the kernel
+            // behave, and our built-in IS the kernel. (Before: GetEntryAddress returned -1 and the exec arguments were
+            // written to 0xFFFFFFFF.) PCSX2 runs the real BIOS, so it executes the copied code.
+            static std::unordered_set<uint32_t> s_reported;
+            if (s_reported.insert(syscallNumber).second)
+                std::cerr << "[syscall] override 0x" << std::hex << syscallNumber << " -> 0x" << handler
+                          << " is not recompiled code; using the built-in syscall" << std::dec << std::endl;
+            return false;
         }
 
         GuestInvocation invocation{};
@@ -485,6 +500,121 @@ namespace ps2_syscalls
         runtime->setEeSyscallOverride(rdram, syscallIndex, handler);
 
         setReturnS32(ctx, 0);
+    }
+
+    // Launch arguments (row 246). The kernel's SetupThread copies the arguments ExecPS2/LoadExecPS2 stored
+    // into the crt0's args area: { s32 argc; u32 argv[16]; char payload[256]; } (ps2sdk crt0 `_args`), argv[0]
+    // = the boot path. We have no BIOS to store them, so they come from the host: PS2X_GUEST_ARGS = the
+    // arguments after argv[0], space-separated (default unset = area left as is, argc 0, the previous
+    // behaviour); PS2X_GUEST_ARGV0 overrides argv[0] (default "cdrom0:\<ELF name>;1"). PCSX2 does the same
+    // job for its launch arguments by rewriting EELOAD's argv (R5900.cpp eeloadHook/eeloadHook2) and lets the
+    // real kernel deliver them; same layout, same argv[0]-first convention.
+    static void writeGuestLaunchArgs(uint8_t *rdram, uint32_t argsAddr)
+    {
+        const char *extra = std::getenv("PS2X_GUEST_ARGS");
+        if (argsAddr == 0u || extra == nullptr || *extra == '\0')
+        {
+            return;
+        }
+
+        std::vector<std::string> args;
+        if (const char *argv0 = std::getenv("PS2X_GUEST_ARGV0"); argv0 != nullptr && *argv0 != '\0')
+        {
+            args.emplace_back(argv0);
+        }
+        else
+        {
+            args.emplace_back("cdrom0:\\" + PS2Runtime::getIoPaths().elfPath.filename().string() + ";1");
+        }
+        std::istringstream words(extra);
+        for (std::string word; words >> word;)
+        {
+            args.push_back(word);
+        }
+
+        constexpr uint32_t kMaxArgs = 16u;
+        constexpr uint32_t kPayloadSize = 256u;
+        const uint32_t base = argsAddr & PS2_RAM_MASK;
+        const uint32_t payload = base + 4u + kMaxArgs * 4u;
+        uint32_t used = 0u;
+        uint32_t argc = 0u;
+        for (const std::string &arg : args)
+        {
+            const uint32_t len = static_cast<uint32_t>(arg.size()) + 1u;
+            if (argc == kMaxArgs || used + len > kPayloadSize)
+            {
+                std::cerr << "[PS2X_GUEST_ARGS] dropped '" << arg << "' and after: the args area holds "
+                          << kMaxArgs << " arguments / " << kPayloadSize << " bytes" << std::endl;
+                break;
+            }
+            std::memcpy(rdram + payload + used, arg.c_str(), len);
+            const uint32_t ptr = (argsAddr & 0xF0000000u) | (payload + used);
+            std::memcpy(rdram + base + 4u + argc * 4u, &ptr, 4u);
+            used += len;
+            ++argc;
+        }
+        std::memcpy(rdram + base, &argc, 4u);
+        std::cerr << "[PS2X_GUEST_ARGS] argc=" << argc << " at 0x" << std::hex << argsAddr << std::dec;
+        for (uint32_t i = 0; i < argc; ++i)
+        {
+            std::cerr << " [" << args[i] << "]";
+        }
+        std::cerr << std::endl;
+    }
+
+    // 0x06 LoadExecPS2(path, argc, argv) / 0x07 ExecPS2(entry, gp, argc, argv) -- row 248, see ps2_loadexec.h.
+    // The guest never returns from a successful exec; when nothing can run the target, the runner stops cleanly.
+    static void execProgram(uint8_t *rdram, PS2Runtime *runtime, const std::string &path, uint32_t argc, uint32_t argvAddr)
+    {
+        std::vector<std::string> args;
+        for (uint32_t i = 0; i < argc && i < 16u; ++i)
+        {
+            uint32_t p = 0;
+            std::memcpy(&p, rdram + ((argvAddr + i * 4u) & PS2_RAM_MASK), 4);
+            std::string a;
+            for (uint32_t k = 0; p != 0u && k < 1024u; ++k)
+            {
+                const char c = static_cast<char>(rdram[(p + k) & PS2_RAM_MASK]);
+                if (!c) break;
+                a.push_back(c);
+            }
+            args.push_back(a);
+        }
+        std::cerr << "[loadexec] '" << path << "' argc=" << args.size();
+        for (const std::string &a : args) std::cerr << " [" << (a.size() > 48 ? a.substr(0, 48) + "..." : a) << "]";
+        std::cerr << std::endl;
+
+        if (ps2x::loadexec::Handler h = ps2x::loadexec::handlerSlot(); h && h(path, args))
+            return;
+        std::string self = PS2Runtime::getIoPaths().elfPath.filename().string();
+        std::string target = ps2x::loadexec::baseName(path);
+        std::transform(self.begin(), self.end(), self.begin(), [](unsigned char c) { return std::toupper(c); });
+        std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return std::toupper(c); });
+        if (!target.empty() && target == self)
+            ps2x::loadexec::restartGuest(args);   // returns only on failure
+        std::cerr << "[loadexec] '" << path << "' is not part of this recompilation; stopping" << std::endl;
+        runtime->requestStop();
+    }
+
+    void LoadExecPS2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::string path;
+        const uint32_t pathAddr = getRegU32(ctx, 4);
+        for (uint32_t k = 0; pathAddr != 0u && k < 256u; ++k)
+        {
+            const char c = static_cast<char>(rdram[(pathAddr + k) & PS2_RAM_MASK]);
+            if (!c) break;
+            path.push_back(c);
+        }
+        execProgram(rdram, runtime, path, getRegU32(ctx, 5), getRegU32(ctx, 6));
+        setReturnS32(ctx, -1);
+    }
+
+    void ExecPS2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // An entry point in memory already loaded: nothing to name; treat as this program.
+        execProgram(rdram, runtime, PS2Runtime::getIoPaths().elfPath.filename().string(), getRegU32(ctx, 6), getRegU32(ctx, 7));
+        setReturnS32(ctx, -1);
     }
 
     // 0x3C SetupThread
@@ -550,6 +680,7 @@ namespace ps2_syscalls
         }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+        writeGuestLaunchArgs(rdram, getRegU32(ctx, 7));
         setReturnU32(ctx, sp);
     }
 
@@ -996,6 +1127,14 @@ namespace ps2_syscalls
         {
             std::memcpy(&handler, ptr, sizeof(handler));
         }
+        // Row 251: on the console every unused slot (RFU) points at kernel code, and the SDK's LoadExecPS2/ExecPS2
+        // REUSES that spot as scratch for the exec arguments (SetArg: GetEntryAddress(3) -> a pointer table + the
+        // strings, ~330 bytes, copied there with its own kCopy syscall 0x5A). Our table holds no handler there
+        // (0 / -1), which sent the arguments to 0xFFFFFFFF and the exec to an empty path. Hand out a reserved block
+        // of kernel RAM instead (0x400 bytes after the 128-entry table; nothing else in the runtime uses it).
+        // PCSX2 runs the real BIOS, whose slot holds a real kernel address.
+        if (handler == 0u || handler == 0xFFFFFFFFu)
+            handler = kGuestSyscallTableGuestBase + 0x480u;   // 0x80012400
         setReturnU32(ctx, handler);
     }
 

@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include <cstring>   // cont.346f: padLog
 
 namespace ps2_stubs
 {
@@ -80,6 +81,24 @@ namespace ps2_stubs
             {
                 state.buttons = static_cast<uint16_t>(state.buttons & ~mask);
             }
+        }
+
+        // cont.346f PS2X_PAD_LIBLOG (default ON, rate-limited per port+call): what libpad queries
+        // the guest makes PER PORT and what we answer. Co-op turns port 1 into a real participant
+        // for the first time, and the EE-side scePad* API is ours alone -- PCSX2 emulates the SIO
+        // protocol with the real libpad on its IOP, so it has no counterpart to check this against.
+        void padLog(int port, int slot, const char *fn, long a, long b, long ret)
+        {
+            static const bool on = []
+            { const char *e = std::getenv("PS2X_PAD_LIBLOG"); return !(e && e[0] == '0'); }();
+            if (!on) return;
+            static int n[2][8] = {};
+            const int p = (port >= 0 && port < 2) ? port : 0;
+            static const char *names[8] = {"open","getstate","infomode","setmainmode","infoact","other","other","other"};
+            int k = 5;
+            for (int i = 0; i < 5; ++i) if (std::strcmp(fn, names[i]) == 0) { k = i; break; }
+            if (++n[p][k] > 12) return;
+            std::fprintf(stderr, "[padlib] port=%d slot=%d %-11s a=%ld b=%ld -> %ld\n", port, slot, fn, a, b, ret);
         }
 
         int findFirstGamepad()
@@ -288,7 +307,9 @@ namespace ps2_stubs
             bool useOverride = false;
             {
                 std::lock_guard<std::mutex> lock(g_padOverrideMutex);
-                if (g_padOverrideEnabled)
+                // cont.346c: the scripted override is a single GLOBAL state, so it drives player 1
+                // only -- applying it to port 1 as well would make player 2 mirror the script.
+                if (g_padOverrideEnabled && port <= 0)
                 {
                     state = g_padOverrideState;
                     useOverride = true;
@@ -308,8 +329,12 @@ namespace ps2_stubs
                     state.ly = backendData[7];
                     usedBackend = true;
                 }
-                else
+                else if (port <= 0)
                 {
+                    // cont.346c: PORT 0 ONLY. These fallbacks read raylib gamepad 0 + the player-1
+                    // keyboard, so running them for port 1 would make player 2 mirror player 1 --
+                    // exactly the bug the per-port backend exists to remove. A port the backend
+                    // declines stays NEUTRAL (all released, sticks centred).
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
@@ -470,12 +495,16 @@ namespace ps2_stubs
                 state = kPadStateStable;
             }
         }
+        padLog(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)),
+               "getstate", 0, 0, state);
         setReturnS32(ctx, state);
     }
 
     void scePadInfoAct(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const int32_t act = static_cast<int32_t>(getRegU32(ctx, 6));
+        padLog(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)),
+               "infoact", act, 0, -1);
         std::lock_guard<std::mutex> lock(g_padStateMutex);
         const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
                                                                  static_cast<int>(getRegU32(ctx, 5)));
@@ -508,6 +537,8 @@ namespace ps2_stubs
 
         const int32_t infoMode = static_cast<int32_t>(getRegU32(ctx, 6)); // a2
         const int32_t index = static_cast<int32_t>(getRegU32(ctx, 7));    // a3
+        padLog(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)),
+               "infomode", infoMode, index, -1);
         std::lock_guard<std::mutex> lock(g_padStateMutex);
         const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
                                                                  static_cast<int>(getRegU32(ctx, 5)));
@@ -529,18 +560,26 @@ namespace ps2_stubs
         case 3: // PAD_MODECUROFFS
             setReturnS32(ctx, 0);
             return;
-        case 4: // PAD_MODETABLE
-            if (index == -1)
+        case 4: // PAD_MODETABLE -- the list of modes this pad SUPPORTS, not the one it is in.
+            // cont.346f: we advertised exactly ONE mode (whatever the pad was currently in), so a
+            // caller enumerating the table looking for PAD_TYPE_DUALSHOCK (7) never found it on a
+            // port still in digital -- the game then asks for "an analog controller (DUALSHOCK2)".
+            // A real DS2 supports digital (4) AND dualshock (7). PS2X_PAD_MODETABLE=0 restores the
+            // single-entry table. (No PCSX2 counterpart: it emulates the SIO protocol and runs the
+            // real libpad on its IOP, so scePadInfoMode is ours alone -- this follows the libpad
+            // spec, and is env-revertible precisely because it is not mirrored from a reference.)
             {
-                setReturnS32(ctx, 1); // one available mode
-            }
-            else if (index == 0)
-            {
-                setReturnS32(ctx, currentId);
-            }
-            else
-            {
-                setReturnS32(ctx, 0);
+                static const bool ds2Table = []
+                { const char *e = std::getenv("PS2X_PAD_MODETABLE"); return !(e && e[0] == '0'); }();
+                if (!ds2Table)
+                {
+                    setReturnS32(ctx, index == -1 ? 1 : (index == 0 ? currentId : 0));
+                    return;
+                }
+                if (index == -1)      setReturnS32(ctx, 2);                    // two supported modes
+                else if (index == 0)  setReturnS32(ctx, kPadTypeDigital);      // 4
+                else if (index == 1)  setReturnS32(ctx, kPadTypeDualShock);    // 7
+                else                  setReturnS32(ctx, 0);
             }
             return;
         default:
@@ -609,6 +648,8 @@ namespace ps2_stubs
             return;
         }
 
+        padLog(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)),
+               "open", static_cast<long>(dmaAddr), 0, 1);
         portState->open = true;
         portState->analogMode = false;     // real pads open DIGITAL
         portState->pressureEnabled = false;
@@ -728,6 +769,8 @@ namespace ps2_stubs
             return;
         }
 
+        padLog(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)),
+               "setmainmode", static_cast<long>(getRegU32(ctx, 6)), 0, 1);
         portState->analogMode = (getRegU32(ctx, 6) != 0u);
         portState->reqState = 0u;
         queueExecCmdStateLocked(*portState);

@@ -42,8 +42,12 @@ namespace ps2_syscalls
 
     static const char *translateFioMode(int ps2Flags)
     {
-        bool read = (ps2Flags & PS2_FIO_O_RDONLY) || (ps2Flags & PS2_FIO_O_RDWR);
-        bool write = (ps2Flags & PS2_FIO_O_WRONLY) || (ps2Flags & PS2_FIO_O_RDWR);
+        // The access mode is a 2-bit VALUE (1 read, 2 write, 3 both), not two flag bits: `flags & RDWR` alone made every
+        // O_RDONLY open a write ("r+b"), which fails on a read-only disc copy (row 250; PCSX2 IopBios.cpp open:
+        // `switch (flags & IOP_O_RDWR)`).
+        const uint32_t access = static_cast<uint32_t>(ps2Flags) & PS2_FIO_O_RDWR;
+        bool read = access == PS2_FIO_O_RDONLY || access == PS2_FIO_O_RDWR;
+        bool write = access == PS2_FIO_O_WRONLY || access == PS2_FIO_O_RDWR;
         bool append = (ps2Flags & PS2_FIO_O_APPEND);
         bool create = (ps2Flags & PS2_FIO_O_CREAT);
         bool truncate = (ps2Flags & PS2_FIO_O_TRUNC);

@@ -69,14 +69,16 @@ namespace ps2recomp
 
     MemoryAccessHint InstructionTranslator::effectiveMemoryHintFor(const Instruction &inst, const MemoryAccessHint &memoryHint) const
     {
-        MemoryAccessHint effectiveMemoryHint = memoryHint;
-        if (inst.isMmio)
-        {
-            effectiveMemoryHint.hasAddress = true;
-            effectiveMemoryHint.address = inst.mmioAddress;
-        }
-
-        return effectiveMemoryHint;
+        // The config's [mmio] table (ps2_analyzer output) says WHICH accesses touch hardware; its ADDRESS is
+        // not trustworthy and must never be hard-coded into the output. The analyzer pairs an access with
+        // the nearest LUI of its base register and ignores any ORI/ADDIU in between, so `lui v1,0x1000 ..
+        // ori v1,v1,0x2000 .. sw v0,0(v1)` was recorded as 0x10000000 (SLES_520.17: 96 of its 208 entries
+        // were that LUI-only value -- libmpeg's IPU_CTRL polls read the EE timer, its IPU commands went to
+        // T0_COUNT, and the native FMV decoder spun forever). isMmio still selects the runtime-dispatched
+        // Load/Store path; the literal address comes only from the emitter's own constant tracking
+        // (cleared at every label), else from the guest's computed address.
+        (void)inst;
+        return memoryHint;
     }
 
     std::string InstructionTranslator::translateMemoryRead(const Instruction &inst,

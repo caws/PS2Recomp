@@ -206,7 +206,8 @@ namespace ps2recomp
                     ss << "    " << cg.translateInstruction(inst, memoryHint);
                     if (inst.isMmio)
                     {
-                        ss << " // MMIO: 0x" << std::hex << inst.mmioAddress << std::dec;
+                        // The analyzer's address is a hint only (see InstructionTranslator::effectiveMemoryHintFor).
+                        ss << " // MMIO (analyzer hint 0x" << std::hex << inst.mmioAddress << std::dec << ")";
                     }
                     ss << "\n";
 

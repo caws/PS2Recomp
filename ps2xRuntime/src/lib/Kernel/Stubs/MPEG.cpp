@@ -83,6 +83,26 @@ namespace ps2_stubs
                     return false;
                 }
 
+                // cont.230 (LOTR FMV corruption): PS2X_MPEG_DUMP=<path> appends EVERY byte handed to the
+                // parser, in order, so the fed stream can be diffed against the movie file's own payload
+                // (which decodes clean with the ffmpeg CLI once the 64-byte sector headers are stripped).
+                {
+                    static const char *const s_dumpPath = std::getenv("PS2X_MPEG_DUMP");
+                    static FILE *s_dumpFile = s_dumpPath ? std::fopen(s_dumpPath, "wb") : nullptr;
+                    static size_t s_dumpTotal = 0u;
+                    static unsigned s_dumpN = 0u;
+                    if (s_dumpFile)
+                    {
+                        std::fwrite(data, 1, size, s_dumpFile);
+                        std::fflush(s_dumpFile);
+                        s_dumpTotal += size;
+                        ++s_dumpN;
+                        if (s_dumpN <= 48u || (s_dumpN % 512u) == 0u)
+                            std::fprintf(stderr, "[MPEG] feed #%u size=%zu total=%zu first=%02x%02x%02x%02x\n",
+                                         s_dumpN, size, s_dumpTotal, data[0], size > 1 ? data[1] : 0,
+                                         size > 2 ? data[2] : 0, size > 3 ? data[3] : 0);
+                    }
+                }
                 static uint32_t s_feedLogCount = 0u;
                 const bool shouldLog = (s_feedLogCount < 32u);
                 if (shouldLog)
@@ -495,6 +515,13 @@ namespace ps2_stubs
             bool sawSequenceEnd = false;
             bool streamEnded = false;
             bool decoderFailed = false;
+            // Data-empty (sceMpegAddCallback type-1) refill-callback pump state — see
+            // queueMpegDataCallback. inFlight: one queued invocation at a time; exhausted: the
+            // game's handler returned 0 (no more bitstream) — stop driving, let GetPicture return;
+            // rounds: per-picture drive budget, reset when a frame is served.
+            bool dataCbInFlight = false;
+            bool dataCbExhausted = false;
+            uint32_t dataCbRounds = 0u;
             uint64_t cdStreamGeneration = 0u;
             bool waitingForVideoSequenceHeader = true;
             std::vector<uint8_t> videoSequenceSyncBuffer;
@@ -547,6 +574,19 @@ namespace ps2_stubs
         std::mutex g_mpeg_stub_mutex;
         constexpr uint32_t kMpegPictureWaitType = 1u;
         MpegStubState g_mpeg_stub_state;
+
+        // Data-empty callback drive (PS2X_MPEG_DATACB, default ON; =0 reverts to register-only).
+        // Type 1 = libmpeg's "bitstream empty" data-request callback: the real decode driver calls
+        // the game's registered handler whenever it needs more elementary-stream bytes, and the
+        // handler answers by feeding queued sections through sceMpegAddBs (LOTR ROTK registers
+        // func=0x13B3A0: pops one queued MPG2 section per call, returns nonzero; on an empty queue
+        // it flags its job engine ([job+0x102F]=1) and returns 0 so the movie ends via guest code).
+        // The refactored HLE stores these registrations but never invokes them — the decoder
+        // starves forever. See queueMpegDataCallback.
+        constexpr uint32_t kMpegDataCallbackType = 1u;
+        constexpr uint32_t kMpegDataCallbackMaxRounds = 512u;
+        const bool s_mpegDataCbDrive = []
+        { const char *e = std::getenv("PS2X_MPEG_DATACB"); return !(e && e[0] == '0'); }();
 
         // TODO this resolution should follow runtime resolution
         constexpr uint32_t kStubMovieWidth = 320u;
@@ -1652,6 +1692,115 @@ namespace ps2_stubs
             dispatchStreamCallbacks(rdram, ctx, runtime, events);
         }
 
+        // Non-stream callbacks registered via sceMpegAddCallback, matched by callback type.
+        std::vector<MpegRegisteredCallback> matchingDataCallbacks(uint32_t mpegAddr, uint32_t callbackType)
+        {
+            std::vector<MpegRegisteredCallback> out;
+            auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+            if (it == g_mpeg_stub_state.callbacksByMpeg.end())
+            {
+                return out;
+            }
+            for (const MpegRegisteredCallback &callback : it->second)
+            {
+                if (!callback.stream && callback.type == callbackType)
+                {
+                    out.push_back(callback);
+                }
+            }
+            return out;
+        }
+
+        // Queue ONE type-1 "bitstream empty" data-request invocation for `mpegAddr` (see the
+        // block comment at kMpegDataCallbackType). Args mirror the real libmpeg driver's call
+        // into the registered handler: a0 = the SceMpeg handle, a1 = 0 (no data block for the
+        // known type-1 handlers), a2 = the data pointer given at registration. The handler runs
+        // as a scheduler invocation (same mechanism as the stream callbacks); its sceMpegAddBs
+        // feeding wakes any sceMpegGetPicture external-waiter by itself. onComplete re-arms the
+        // pump while the handler reports data fed (v0 != 0) and no frame has been decoded yet,
+        // and on v0 == 0 marks the stream exhausted + wakes the waiter so GetPicture returns
+        // (the game's handler has already flagged its own job engine to end the movie).
+        // Everything here runs on the EE executor thread, so queue-then-wait has no lost-wakeup
+        // race (the invocation cannot run before the waiter unwinds into the scheduler).
+        void queueMpegDataCallback(uint8_t *rdram,
+                                   const R5900Context &templateCtx,
+                                   PS2Runtime *runtime,
+                                   uint32_t mpegAddr)
+        {
+            if (!s_mpegDataCbDrive || !rdram || !runtime)
+            {
+                return;
+            }
+            MpegRegisteredCallback callback{};
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                if (playback.dataCbInFlight || playback.dataCbExhausted ||
+                    playback.dataCbRounds >= kMpegDataCallbackMaxRounds)
+                {
+                    return;
+                }
+                const std::vector<MpegRegisteredCallback> callbacks =
+                    matchingDataCallbacks(mpegAddr, kMpegDataCallbackType);
+                if (callbacks.empty())
+                {
+                    return;
+                }
+                callback = callbacks.front();
+                playback.dataCbInFlight = true;
+                ++playback.dataCbRounds;
+            }
+            if (callback.func == 0u || !runtime->hasFunction(callback.func))
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                getPlaybackState(mpegAddr).dataCbInFlight = false;
+                return;
+            }
+
+            R5900Context callbackCtx = templateCtx;
+            SET_GPR_U32(&callbackCtx, 4, mpegAddr);
+            SET_GPR_U32(&callbackCtx, 5, 0u);
+            SET_GPR_U32(&callbackCtx, 6, callback.data);
+            SET_GPR_U32(&callbackCtx, 7, 0u);
+            SET_GPR_U32(&callbackCtx, 29, 0u); // scheduler assigns an invocation stack
+            SET_GPR_U32(&callbackCtx, 31, 0u);
+            callbackCtx.pc = callback.func;
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.context = callbackCtx;
+            invocation.onComplete = [rdram, runtime, mpegAddr](const R5900Context &finished,
+                                                              R5900Context &)
+            {
+                R5900Context finishedCopy = finished;
+                const uint32_t fed = getRegU32(&finishedCopy, 2);
+                bool rearm = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                    MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                    playback.dataCbInFlight = false;
+                    if (fed == 0u)
+                    {
+                        playback.dataCbExhausted = true;
+                    }
+                    else if (playback.decodedFrames.empty() &&
+                             !playback.streamEnded && !playback.decoderFailed)
+                    {
+                        rearm = true;
+                    }
+                }
+                if (fed == 0u)
+                {
+                    runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+                }
+                else if (rearm)
+                {
+                    queueMpegDataCallback(rdram, finished, runtime, mpegAddr);
+                }
+            };
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
+        }
+
         void writeBlankMpegFrame(uint8_t *rdram, uint32_t destAddr, uint32_t width, uint32_t height)
         {
             if (!rdram || destAddr == 0u)
@@ -1877,10 +2026,35 @@ namespace ps2_stubs
     {
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
-        const uint32_t byteCount = getRegU32(ctx, 6);
+        const uint32_t requested = getRegU32(ctx, 6);
+        // ★★★ cont.230 (LOTR FMV corruption): the REAL libmpeg sceMpegAddBs does not consume `size`
+        // bytes -- it consumes ((size + 19) >> 4) << 4 of them. The game's own copy of the library
+        // (SLES_520.17 @0x117188, disassembled) is:
+        //     addiu v1, a2, 19 ; ... ; sra a2, v1, 4 ; jal <bitstream add>(mp->internal, ptr, qwords) ;
+        //     sll a2, a2, 4  (delay slot: bytes = qwords << 4)
+        // so a 16-byte-aligned request reads ONE EXTRA QUADWORD past ptr+size (the SDK's "the library
+        // reads up to 16 bytes beyond the buffer" rule). LOTR's demuxer relies on it: each 4096-byte
+        // "2GPM" sector carries a 4032-byte payload, and the game calls AddBs(payload, 4016) per sector
+        // -- with `size` honoured literally, 16 real bytes vanished from every sector and ffmpeg reported
+        // ~11,000 damaged slices per movie. Feeding what the hardware library feeds decodes the same
+        // stream clean (the file's payloads, extracted standalone, decode with zero errors in the ffmpeg
+        // CLI). The odd `-1 < size + 19` guard only matters for absurd negative sizes; mirrored anyway.
+        const uint32_t byteCount =
+            (static_cast<int32_t>(requested) + 19 > -1)
+                ? static_cast<uint32_t>(((static_cast<int32_t>(requested) + 19) >> 4) << 4)
+                : static_cast<uint32_t>(((static_cast<int32_t>(requested) + 34) >> 4) << 4);
 
         size_t copied = 0u;
         bool wakePictureWaiter = false;
+        {
+            // cont.230: with PS2X_MPEG_DUMP set, also log the AddBs calls themselves (address + sizes), so
+            // buffer reuse / ordering is visible next to the fed bytes.
+            static const bool s_addbsLog = std::getenv("PS2X_MPEG_DUMP") != nullptr;
+            static unsigned s_addbsN = 0u;
+            if (s_addbsLog && (++s_addbsN <= 48u || (s_addbsN % 512u) == 0u))
+                std::fprintf(stderr, "[MPEG] addbs #%u mpeg=0x%x data=0x%x requested=%u fed=%u\n",
+                             s_addbsN, mpegAddr, dataAddr, requested, byteCount);
+        }
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -2295,7 +2469,8 @@ namespace ps2_stubs
             if (playback.decodedFrames.empty() &&
                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
                 !playback.streamEnded &&
-                !playback.decoderFailed)
+                !playback.decoderFailed &&
+                !playback.dataCbExhausted)
             {
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
@@ -2308,6 +2483,11 @@ namespace ps2_stubs
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
                 lock.unlock();
+                // Drive the game's type-1 "bitstream empty" refill callback so the decoder gets
+                // fed (see queueMpegDataCallback); its sceMpegAddBs feeding — or exhaustion —
+                // completes this external wait. Ordering is safe: the invocation runs only after
+                // this thread unwinds into the scheduler.
+                queueMpegDataCallback(rdram, *ctx, runtime, mpegAddr);
                 runtime->eeScheduler().waitExternal(
                     EeWaitReason::Mpeg,
                     kMpegPictureWaitType,
@@ -2368,6 +2548,7 @@ namespace ps2_stubs
                 playback.picturesServed += 1u;
                 playback.nextPictureTickQ32 = presentationTargetQ32 + frameIntervalQ32;
                 playback.presentationEndTickQ32 = playback.nextPictureTickQ32;
+                playback.dataCbRounds = 0u; // fresh refill budget per served picture
                 haveFrame = true;
                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
                 {

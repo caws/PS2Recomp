@@ -192,14 +192,16 @@ namespace GSMem
     }};
 
     // this is going to be massive (an entire page of addess lookups)
-    static C32PageLookupTable  PageTableC32{ };
-    static Z32PageLookupTableT PageTableZ32{ };
+    // cont.225: these two are declared extern in the header so the rasterizer's CT32+Z24 fast path
+    // can inline PixelStorageTraits<> instead of going through a function pointer.
+    C32PageLookupTable  PageTableC32{ };
+    Z32PageLookupTableT PageTableZ32{ };
     static C16PageLookupTable  PageTableC16{ };
     static C16SPageLookupTable PageTableC16S{ };
     static Z16PageLookupTable  PageTableZ16{ };
     static Z16SPageLookupTable PageTableZ16S{ };
-    static P8PageLookupTable   PageTableP8{ };
-    static P4PageLookupTable   PageTableP4{ };
+    P8PageLookupTable          PageTableP8{ }; // cont.317: extern, see the header
+    P4PageLookupTable          PageTableP4{ }; // cont.228: extern, see the header
 
     void InitLookupTables()
     {

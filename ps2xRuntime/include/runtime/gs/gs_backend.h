@@ -14,6 +14,9 @@ public:
     virtual void Reset() = 0;
 
     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
+    // cont.230: end of a GIF packet (or of an arbiter drain) -- a backend that buffers draws may
+    // release them here. Default: nothing.
+    virtual void EndPacket() {}
 
     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
     virtual void UploadImage(const uint8_t *data, uint32_t sizeBytes) = 0;

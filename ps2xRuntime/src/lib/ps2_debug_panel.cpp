@@ -1,4 +1,5 @@
 #include "ps2_debug_panel.h"
+#include <cstdlib>
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_log.h"
@@ -2141,6 +2142,8 @@ namespace
 
 #endif
 }
+std::atomic<bool> g_ps2xDebugUiVisible{false};
+
 void PS2DebugPanel::initialize()
 {
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -2148,6 +2151,13 @@ void PS2DebugPanel::initialize()
     {
         rlImGuiSetup(true);
         m_initialized = true;
+    }
+    // cont.232 PS2X_DEBUG_UI (default 0 = the overlay starts HIDDEN; "=1" = starts visible, the old
+    // behaviour; F1 toggles it either way). An open overlay keeps the presenter loop drawing at 60 Hz
+    // (PS2X_GS_PRESENT_LAZY), which the cont.232 §5 ablation measured at ~13% of the level's frame rate.
+    {
+        const char *e = std::getenv("PS2X_DEBUG_UI");
+        setVisible(e && e[0] && e[0] != '0');
     }
 #endif
 }
@@ -2186,6 +2196,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
     {
+        g_ps2xDebugUiVisible.store(m_visible); // the window's close box clears m_visible
         if (ImGui::BeginMenuBar())
         {
             ImGui::MenuItem("Registers", nullptr, &m_showRegisters);

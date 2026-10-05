@@ -3,6 +3,8 @@
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
 
+bool ps2xVirtualTimeEnabled() noexcept; // EeScheduler.cpp (cont.322e)
+
 namespace ps2_stubs
 {
     namespace
@@ -519,11 +521,27 @@ namespace ps2_stubs
 
         std::time_t now = std::time(nullptr);
         std::tm localTm{};
+        if (ps2xVirtualTimeEnabled())
+        {
+            // cont.322e PS2X_VIRTUAL_TIME: the RTC is the only host clock the guest can read (this game
+            // calls it from 0x1380B0 and 0x2629E0); a deterministic replay needs a deterministic date --
+            // a fixed epoch plus the vsync tick at 50 Hz, in UTC so the host time zone cannot leak.
+            const uint64_t tick = runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
+            now = static_cast<std::time_t>(1072915200ll + static_cast<long long>(tick / 50u)); // 2004-01-01 00:00:00 UTC
+#ifdef _WIN32
+            gmtime_s(&localTm, &now);
+#else
+            gmtime_r(&now, &localTm);
+#endif
+        }
+        else
+        {
 #ifdef _WIN32
         localtime_s(&localTm, &now);
 #else
         localtime_r(&now, &localTm);
 #endif
+        }
 
         // sceCdCLOCK format (BCD fields).
         clockData[0] = 0;

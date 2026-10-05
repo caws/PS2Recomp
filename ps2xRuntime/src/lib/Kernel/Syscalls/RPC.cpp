@@ -962,21 +962,22 @@ namespace ps2_syscalls
 
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t cid = getRegU32(ctx, 4);
-        uint32_t packetAddr = getRegU32(ctx, 5);
-        uint32_t packetSize = getRegU32(ctx, 6);
-        uint32_t srcExtra = getRegU32(ctx, 7);
-
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
-
-        if (sizeExtra > 0 && srcExtra && destExtra)
-        {
-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
-        }
+        // sceSifSendCmd(cid, packet, packet_size, src_extra, dest_extra, size_extra): SIX register
+        // arguments. ★ cont.317: the EE ABI passes arguments 5 and 6 in $t0/$t1 (a0-a3, t0-t3 carry
+        // the first eight), and that is exactly what this game's per-frame SIF flush (0x154920)
+        // loads: t0 = the IOP destination, t1 = the 64-byte-rounded length. The previous read of
+        // 0x10(sp)/0x14(sp) -- an o32 stack layout the EE does not use -- returned stack
+        // leftovers (dest=0xffffffff, size>1 MB), so every flush ran rpcCopyToRdram's byte loop
+        // over the 1 MB clamp: 2.5-5% of the EE thread, and a shifted copy of RAM 0x4001.. written
+        // over 0x0..0xFFFFE. dest_extra is an IOP address; this runtime has no IOP RAM and the
+        // IOP-side HLE reads the EE buffers directly, so the extra-data DMA has no target here and
+        // is not copied anywhere. (PCSX2 runs the real IOP kernel, so it has no equivalent stub.)
+        const uint32_t cid = getRegU32(ctx, 4);
+        const uint32_t packetAddr = getRegU32(ctx, 5);
+        const uint32_t packetSize = getRegU32(ctx, 6);
+        const uint32_t srcExtra = getRegU32(ctx, 7);
+        const uint32_t destExtra = getRegU32(ctx, 8);
+        const uint32_t sizeExtra = getRegU32(ctx, 9);
 
         static int logCount = 0;
         if (logCount < 5)
@@ -984,7 +985,9 @@ namespace ps2_syscalls
             RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
                                                  << " packet=0x" << packetAddr
                                                  << " psize=0x" << packetSize
-                                                 << " extra=0x" << destExtra << std::dec << std::endl);
+                                                 << " src=0x" << srcExtra
+                                                 << " dest(iop)=0x" << destExtra
+                                                 << " size=0x" << sizeExtra << std::dec << std::endl);
             ++logCount;
         }
 

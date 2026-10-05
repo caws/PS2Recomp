@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include "runtime/ps2_gs_pipeline.h"
 
 namespace
 {
@@ -1890,14 +1891,33 @@ namespace
         regs.bgcolor = env.bgcolor;
     }
 
+    // ★ cont.318: an HLE-originated GS drawing-context write. With the pipeline THREAD on (mode 2) it
+    // must be ordered with the packet stream, so it rides the ring; otherwise (modes 0/1, where the
+    // caller's thread is the one draining the stream) it is applied directly, as before.
+    static void gsWriteRegisterOrdered(PS2Runtime *runtime, uint8_t reg, uint64_t value)
+    {
+        if (ps2gs::threaded() && ps2gs::producerSide())
+            ps2gs::enqueueGsReg(&runtime->gs(), reg, value);
+        else
+            runtime->gs().writeRegister(reg, value);
+    }
+    static void gsClearFramebufferOrdered(PS2Runtime *runtime, uint32_t contextIndex, uint32_t rgba)
+    {
+        if (ps2gs::threaded() && ps2gs::producerSide())
+            ps2gs::enqueueGsClear(&runtime->gs(), contextIndex, rgba);
+        else
+            runtime->gs().clearFramebufferContext(contextIndex, rgba);
+    }
     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
             return;
         for (size_t i = 0; i < pairCount; ++i)
         {
-            runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
+            gsWriteRegisterOrdered(runtime, static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
         }
+        if (ps2gs::threaded() && ps2gs::producerSide())
+            ps2gs::pump();
     }
 
     static void seedGsDrawEnv1(GsDrawEnv1Mem &env,

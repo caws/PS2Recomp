@@ -75,6 +75,38 @@ else()
         set(PLATFORM "Android" CACHE STRING "" FORCE)
     endif()
 
+    # rumble: raylib's desktop GLFW backend has no vibration output (SetGamepadVibration logs
+    # "not available on target platform" and returns; GLFW's joystick API is read-only), while its
+    # SDL backend drives SDL_GameControllerRumble -- the Vita and Android builds already run on SDL.
+    # SDL2 is fetched and linked statically rather than taken from the system: raylib 5.5's SDL
+    # backend needs SDL >= 2.0.16 (SDL_SetWindowAlwaysOnTop, SDL_OpenURL), which distro packages
+    # can lag, and a player then needs no SDL package installed. `-DPS2X_RAYLIB_SDL=OFF` = GLFW.
+    option(PS2X_RAYLIB_SDL "Build raylib's desktop platform on SDL2 (gamepad rumble)" ON)
+    if(PS2X_RAYLIB_SDL AND NOT PS2X_IS_ANDROID)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            SDL2
+            GIT_REPOSITORY "https://github.com/libsdl-org/SDL.git"
+            GIT_TAG "release-2.30.12"
+            GIT_SHALLOW TRUE
+            GIT_PROGRESS TRUE
+        )
+        FetchContent_MakeAvailable(SDL2)
+        if(NOT TARGET SDL2::SDL2)
+            add_library(SDL2::SDL2 ALIAS SDL2-static)
+        endif()
+        # raylib's LibraryConfigurations.cmake does find_package(SDL2 REQUIRED): satisfy it with the
+        # target above instead of a system install.
+        file(WRITE "${CMAKE_BINARY_DIR}/ps2x_sdl2_config/SDL2Config.cmake" "set(SDL2_FOUND TRUE)\n")
+        set(SDL2_DIR "${CMAKE_BINARY_DIR}/ps2x_sdl2_config" CACHE PATH "" FORCE)
+        set(PLATFORM "SDL" CACHE STRING "" FORCE)
+        message(STATUS "ps2x: raylib platform = SDL (static SDL2 2.30.12)")
+    elseif(NOT PS2X_IS_ANDROID)
+        set(PLATFORM "Desktop" CACHE STRING "" FORCE)
+    endif()
+
     FetchContent_Declare(
         raylib
         GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
@@ -82,6 +114,22 @@ else()
         GIT_PROGRESS TRUE
     )
     FetchContent_MakeAvailable(raylib)
+
+    # ★★★★ cont.303: miniaudio's PulseAudio backend cannot open a playback device on this box.
+    # Proven with a 10-line raylib program (no window, none of our code): the PulseAudio CONTEXT
+    # connects to /run/user/1000/pulse/native and authenticates, then ma_device_init fails -- and
+    # because the context SUCCEEDED, miniaudio never falls back (libasound is loaded ZERO times).
+    # ALSA itself is healthy here (aplay works, and it routes through PipeWire's ALSA plugin so
+    # mixing is unaffected). Blocking PulseAudio flips the device open:
+    #     WARNING: AUDIO: Failed to initialize playback device   ->   IsAudioDeviceReady() = 1
+    # Symptom when this bites: a run is COMPLETELY silent while the audio HLE logs perfect work,
+    # which reads exactly like an audio regression (it cost most of cont.302-303 to rule out).
+    # `-DPS2X_AUDIO_NO_PULSE=OFF` restores the stock backend order.
+    option(PS2X_AUDIO_NO_PULSE "Skip miniaudio's PulseAudio backend and use ALSA" ON)
+    if(PS2X_AUDIO_NO_PULSE AND UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID)
+        target_compile_definitions(raylib PRIVATE MA_NO_PULSEAUDIO)
+        message(STATUS "ps2x: miniaudio PulseAudio backend DISABLED (using ALSA)")
+    endif()
 
     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
@@ -242,11 +290,11 @@ else()
     endif()
 endif()
 
-if(PS2X_IS_ANDROID)
-    set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
-else()
-    set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
-endif()
+# rotk (2026-10-02, row 242): OFF on every platform. This game's movies decode through its own libmpeg
+# on the PCSX2 IPU port (cont.247), so nothing calls the FFmpeg-backed Kernel/Stubs/MPEG.cpp HLE; it
+# builds its no-FFmpeg path (as on Android) and the runner no longer links libavcodec/avformat/...
+# A game that routes sceMpeg* to that HLE configures with -DPS2X_ENABLE_FFMPEG=ON.
+set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
 
 option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
 
@@ -375,6 +423,57 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
     )
 endfunction()
 
+# ---- cont.230: PCSX2 microVU port (GPL-3.0+, see src/lib/vu/microvu/README.md) -----------------
+# Built as its own target so PCSX2's sources keep their include layout ("common/emitter/..."),
+# their warnings and their own flags, and never enter the runner's unity build.
+add_library(ps2x_microvu STATIC
+    src/lib/vu/microvu/ps2x_microvu.cpp
+    src/lib/vu/microvu/shim/common/Assertions.cpp
+    src/lib/vu/microvu/pcsx2/common/AlignedMalloc.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/bmi.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/fpu.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/groups.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/jmp.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/legacy.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/legacy_sse.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/movs.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/simd.cpp
+    src/lib/vu/microvu/pcsx2/common/emitter/x86emitter.cpp
+    src/lib/vu/microvu/pcsx2/x86/microVU.cpp
+)
+target_include_directories(ps2x_microvu
+    PRIVATE
+        src/lib/vu/microvu/shim
+        src/lib/vu/microvu/pcsx2
+        src/lib/vu/microvu/pcsx2/common
+        src/lib/vu/microvu/pcsx2/x86
+        include
+)
+target_compile_options(ps2x_microvu PRIVATE -w -fno-strict-aliasing -msse4.1)
+target_compile_definitions(ps2x_microvu PRIVATE PS2X_MICROVU_PORT=1)
+
+# ---- cont.245: PCSX2 IPU port (GPL-3.0+, see src/lib/ipu/README.md) ------------------------------
+# Own target, like the microVU port: PCSX2's sources keep their include layout ("IPU/IPU.h") and their
+# own warnings, and never enter the runner's unity build.
+add_library(ps2x_ipu STATIC
+    src/lib/ipu/ps2x_ipu.cpp
+    src/lib/ipu/pcsx2/IPU/IPU.cpp
+    src/lib/ipu/pcsx2/IPU/IPU_Fifo.cpp
+    src/lib/ipu/pcsx2/IPU/IPUdma.cpp
+    src/lib/ipu/pcsx2/IPU/IPU_MultiISA.cpp
+    src/lib/ipu/pcsx2/IPU/IPUdither.cpp
+    src/lib/ipu/pcsx2/IPU/yuv2rgb.cpp
+)
+target_include_directories(ps2x_ipu
+    PRIVATE
+        src/lib/ipu/shim
+        src/lib/ipu/pcsx2
+        src/lib/vu/microvu/pcsx2
+        include
+)
+target_compile_options(ps2x_ipu PRIVATE -w -fno-strict-aliasing -msse4.1)
+target_compile_definitions(ps2x_ipu PRIVATE PS2X_IPU_PORT=1)
+
 add_library(ps2_runtime STATIC
     src/lib/game_overrides.cpp
     src/lib/gs/ps2_gif_arbiter.cpp
@@ -383,16 +482,42 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_texpack.cpp
     src/lib/ps2_iop_host.cpp
+    src/lib/ps2_dbcman_hle.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_settings.cpp
+    src/lib/ps2_settings_menu.cpp
+    src/lib/ps2_launcher.cpp
+    src/lib/ps2_mods.cpp
+    src/lib/ps2_user_dir.cpp
     src/lib/ps2_vif1_interpreter.cpp
+    src/lib/ps2_pipe_capture.cpp
+    src/lib/ps2_gs_pipeline.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+# ★ cont.326 PS2X_RASTER_AVX2 (default OFF -- MEASURED A LOSS): the CPU rasterizer unit ALONE compiled with VEX
+# encoding (-mavx2; NO -mfma, and -ffp-contract=off so no product+sum is ever fused). Three-operand forms remove
+# the register copies the two-operand SSE encoding needs before every destructive op, and the build is bit-exact
+# (hashes unchanged): Helm's bench at 1 thread retired 6.3% FEWER instructions and 4.6% fewer fused-domain uops
+# (idq.dsb_uops + idq.mite_uops), with the decoded-icache coverage unchanged (92%) and the hot loops' byte size
+# unchanged -- and took 2.0% MORE cycles (+2.2% wall), on every arm of an alternating A/B on a quiet box; 7 threads
+# flat. The register copies it removed were free (move elimination at rename); what it changed in scheduling and
+# memory-operand folding is a diffuse back-end loss with no hot instruction (progress.md cont.326). Kept as an
+# option for a future 256-bit (8-lane) rasterizer, which needs the encoding; ps2_runtime.cpp refuses to start on a
+# host without AVX2 when this is on.
+option(PS2X_RASTER_AVX2 "Compile the CPU rasterizer unit (gs_cpu_backend.cpp) with AVX2 VEX encoding (measured slower, cont.326)" OFF)
+if(PS2X_RASTER_AVX2 AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64"))
+    set_source_files_properties(src/lib/gs/gs_cpu_backend.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-ffp-contract=off")
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_RASTER_AVX2=1)
+    message(STATUS "Rasterizer unit: AVX2 VEX encoding (PS2X_RASTER_AVX2=ON)")
+endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
@@ -439,6 +564,32 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
 )
 
+# Keep the GAME's hand-written override sources OUT of the unity build.
+#
+# The runner mixes two very different kinds of source: machine-generated recompiled functions
+# (thousands of files, which unity batching exists to speed up) and a handful of hand-written
+# override modules copied in from the game repo. Unity-batching the latter is actively harmful:
+#
+#   1. Batches are formed from the source list, so ADDING or REMOVING one override module
+#      re-shuffles every batch after it and forces a near-full rebuild of the runner.
+#   2. Batched files are #include'd into one TU, so file-scope statics (and __LINE__-keyed
+#      names, as PS2_REGISTER_GAME_OVERRIDE generates) can collide across unrelated modules.
+#
+# The engine's scripts/03_build_game.sh writes this manifest when it installs the overrides; each
+# line is one basename in src/runner/. Absent manifest = no overrides to exclude (plain upstream).
+set(GAME_OVERRIDE_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/game_overrides.manifest")
+if(EXISTS "${GAME_OVERRIDE_MANIFEST}")
+    file(STRINGS "${GAME_OVERRIDE_MANIFEST}" GAME_OVERRIDE_BASENAMES)
+    foreach(override_base IN LISTS GAME_OVERRIDE_BASENAMES)
+        set(override_src "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/${override_base}")
+        if(EXISTS "${override_src}")
+            set_source_files_properties("${override_src}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+        endif()
+    endforeach()
+    list(LENGTH GAME_OVERRIDE_BASENAMES override_count)
+    message(STATUS "Game overrides excluded from unity build: ${override_count}")
+endif()
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
@@ -465,6 +616,20 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
         UNITY_BUILD ON
         UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
     )
+endif()
+
+# ---- cont.260 PS2X_RUNNER_SIZE_OPT (default OFF): compile the runner for SIZE (-Os).
+# The runner's .text is 37.9 MB, of which 33.9 MB is generated guest code -- 99.7 bytes of host
+# code per guest instruction, a 24.9x expansion over 4-byte MIPS and ~27x the L2 cache. cont.259
+# measured 23.9 host cycles per guest instruction against 2.6 for the same emitted macro bodies in
+# a cache-warm microbenchmark, so instruction FETCH, not instruction semantics, is the suspected
+# cost. This is the test: if the guest half is i-cache-bound, building it SMALLER should make it
+# FASTER even though -Os emits worse per-instruction code. A speedup confirms the mechanism (and is
+# itself the win); no change is ambiguous, because -Os also degrades the code it shrinks.
+option(PS2X_RUNNER_SIZE_OPT "Compile ps2EntryRunner with -Os (i-cache experiment, cont.260)" OFF)
+if(PS2X_RUNNER_SIZE_OPT)
+    target_compile_options(ps2EntryRunner PRIVATE -Os)
+    message(STATUS "ps2EntryRunner: -Os (PS2X_RUNNER_SIZE_OPT=ON, cont.260 i-cache experiment)")
 endif()
 
 if(PS2X_ENABLE_RUNNER_PCH)
@@ -504,7 +669,52 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop ps2x_microvu ps2x_ipu)
+
+# The launcher's font (ps2_launcher.cpp): Lato, SIL Open Font License 1.1 (embedding permitted), as
+# Zelda 64: Recompiled ships it. Downloaded once at configure time like raylib/SDL and embedded as a
+# byte array, so a player needs no font file. On any failure the launcher falls back to raylib's
+# built-in font (PS2X_LAUNCHER_FONT=0).
+set(PS2X_FONT_DIR "${CMAKE_BINARY_DIR}/ps2x_fonts")
+set(PS2X_FONT_HEADER "${PS2X_FONT_DIR}/ps2x_launcher_font.h")
+set(PS2X_LAUNCHER_FONT_OK 1)
+foreach(face Lato-Regular Lato-Bold)
+    set(ttf "${PS2X_FONT_DIR}/${face}.ttf")
+    if(NOT EXISTS "${ttf}")
+        file(DOWNLOAD "https://github.com/google/fonts/raw/main/ofl/lato/${face}.ttf" "${ttf}"
+             STATUS dlStatus TLS_VERIFY ON)
+        list(GET dlStatus 0 dlCode)
+        if(NOT dlCode EQUAL 0)
+            file(REMOVE "${ttf}")
+            set(PS2X_LAUNCHER_FONT_OK 0)
+            message(WARNING "ps2x: could not download ${face}.ttf; the launcher uses raylib's built-in font")
+        endif()
+    endif()
+endforeach()
+if(PS2X_LAUNCHER_FONT_OK AND NOT EXISTS "${PS2X_FONT_HEADER}")
+    set(fontHeader "// Generated by ps2xRuntime/CMakeLists.txt: Lato (SIL OFL 1.1), embedded for the launcher.\n#pragma once\n")
+    foreach(face Lato-Regular Lato-Bold)
+        file(READ "${PS2X_FONT_DIR}/${face}.ttf" hex HEX)
+        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," hex "${hex}")
+        string(REPLACE "-" "_" sym "${face}")
+        string(APPEND fontHeader "static const unsigned char k${sym}[] = {${hex}};\n")
+    endforeach()
+    file(WRITE "${PS2X_FONT_HEADER}" "${fontHeader}")
+endif()
+if(PS2X_LAUNCHER_FONT_OK)
+    target_include_directories(ps2_runtime PRIVATE "${PS2X_FONT_DIR}")
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_LAUNCHER_FONT=1)
+endif()
+# GPU presentation decode (gs_gpu_device.cpp): desktop-only, links EGL only -- every GL
+# entry point is resolved at runtime through eglGetProcAddress, so no GL link dependency.
+# PS2X_HAS_GS_GPU_DEVICE gates the gs_cpu_backend.cpp integration (0 = CPU decode only).
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    target_sources(ps2_runtime PRIVATE src/lib/gs/gs_gpu_device.cpp)
+    target_link_libraries(ps2_runtime PUBLIC EGL)
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_GS_GPU_DEVICE=1)
+else()
+    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_GS_GPU_DEVICE=0)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime

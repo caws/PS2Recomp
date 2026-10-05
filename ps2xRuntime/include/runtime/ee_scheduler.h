@@ -273,8 +273,46 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
-    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
-    void accountCycles(uint32_t cycles) noexcept;
+    // cont.317 (cont.): the common case of checkpointDue -- nothing pending, no stop, the deadline
+    // not reached, the time slice not ended -- is decided INLINE after the cycle accounting; the
+    // slow path (checkpointDueSlow) is the previous body minus the accounting, entered only when
+    // one of those four could make it return true, so the host-pump gate, the epoch bump, the
+    // deadline latch and the priority/slice logic run exactly as before, in the same order. When
+    // none of the four holds, the old function returned false on every branch too (with the pump
+    // active it returned false even earlier), so the decision is identical.
+    [[nodiscard]] inline bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
+    {
+        accountCycles(cycles);
+        if (__builtin_expect(!m_checkpointPending.load(std::memory_order_acquire) &&
+                             !m_stopRequested.load(std::memory_order_acquire), 1))
+        {
+            const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+            if ((nextEventCycle == 0u || m_eeCycle < nextEventCycle) && m_eeCycle < m_sliceEndCycle)
+                return false;
+        }
+        return checkpointDueSlow();
+    }
+    [[nodiscard]] bool checkpointDueSlow() noexcept;
+
+    // cont.249: bumped every time checkpointDue() reports a checkpoint, i.e. every time a guest call
+    // chain is ABANDONED mid-flight and unwound to the run loop. dispatchGuestBranch() samples it
+    // across a nested call so it can tell "the callee ran and fell through" from "the callee never
+    // completed" -- the two are indistinguishable by ctx->pc alone when the same address is in flight
+    // at two recursion depths, and the confusion resumes the OUTER caller on the INNER frame's sp.
+    [[nodiscard]] uint64_t checkpointEpoch() const noexcept
+    {
+        return m_checkpointEpoch.load(std::memory_order_acquire);
+    }
+    inline void accountCycles(uint32_t cycles) noexcept
+    {
+        const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+        m_eeCycle += elapsed;
+        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+        if (m_pendingEeTimerInterrupts != 0u)
+        {
+            m_checkpointPending.store(true, std::memory_order_release);
+        }
+    }
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
@@ -425,6 +463,7 @@ private:
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_checkpointPending{false};
+    std::atomic<uint64_t> m_checkpointEpoch{0};
     uint32_t m_debugPublishCountdown = 0u;
 
     mutable std::mutex m_eventMutex;
@@ -435,6 +474,7 @@ private:
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
     uint64_t m_vsyncTick = 0;
+    void refreshVblankFromSmode1(); // cont.232: vblank period from SMODE1 CMOD until SetGsCrt speaks
     uint32_t m_vsyncFlagAddress = 0;
     uint32_t m_vsyncTickAddress = 0;
     uint32_t m_gsVSyncCallback = 0;

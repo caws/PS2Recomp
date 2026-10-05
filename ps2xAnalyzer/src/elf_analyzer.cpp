@@ -14,6 +14,43 @@
 #include <limits>
 #include <cstdlib>
 
+namespace
+{
+    // Does this raw R5900 instruction word (possibly) write GPR `reg`? Conservative: anything that is
+    // not clearly a non-writer counts as a write of its rt (I-type/loads/COP moves) or rd (SPECIAL).
+    // Used by the MMIO LUI pairing to abort when the base register is redefined between the LUI and
+    // the access.
+    bool writesGpr(uint32_t word, uint32_t reg)
+    {
+        if (reg == 0)
+            return false;
+        const uint32_t op = (word >> 26) & 0x3Fu;
+        const uint32_t rt = (word >> 16) & 0x1Fu;
+        const uint32_t rd = (word >> 11) & 0x1Fu;
+        switch (op)
+        {
+        case 0x00: // SPECIAL: rd (jalr writes rd too)
+            return rd == reg;
+        case 0x01: // REGIMM: bltzal/bgezal(l) write ra
+            return reg == 31 && ((rt & 0x1Eu) == 0x10u);
+        case 0x02: // J
+            return false;
+        case 0x03: // JAL
+            return reg == 31;
+        case 0x04: case 0x05: case 0x06: case 0x07: // BEQ BNE BLEZ BGTZ
+        case 0x14: case 0x15: case 0x16: case 0x17: // BEQL BNEL BLEZL BGTZL
+            return false;
+        case 0x28: case 0x29: case 0x2A: case 0x2B: // SB SH SWL SW
+        case 0x2C: case 0x2D: case 0x2E: case 0x2F: // SDL SDR SWR CACHE
+        case 0x39: case 0x3E: case 0x3F:            // SWC1 SQC2 SD
+        case 0x1F:                                  // SQ
+            return false;
+        default: // I-type ALU, loads, COP0/COP1/COP2 moves (mfc0/cfc2 write rt): rt
+            return rt == reg;
+        }
+    }
+}
+
 namespace ps2recomp
 {
     static uint32_t decodeAbsoluteJumpTarget(uint32_t instructionAddress, uint32_t targetField);
@@ -423,8 +460,14 @@ namespace ps2recomp
                     // Also check for direct addressing with LUI+ADDIU combinations
                     else if (inst.opcode == OPCODE_LW || inst.opcode == OPCODE_SW)
                     {
-                        // Look for the LUI instruction that sets up the high bits
+                        // Look for the LUI instruction that sets up the high bits, applying any
+                        // ORI/ADDIU on the same register between that LUI and the access (the SCE
+                        // libraries write `lui v1,0x1000; <other insn>; ori v1,v1,0x2000; sw v0,0(v1)`;
+                        // pairing the access with the bare LUI recorded 0x10000000 for 96 of the 208
+                        // MMIO accesses of SLES_520.17). Any other write to the register aborts the match.
                         uint32_t baseAddr = 0;
+                        uint32_t lowAdjust = 0;
+                        bool baseClobbered = false;
                         for (int i = 1; i <= 5 && static_cast<int>(inst.address) - i * 4 >= static_cast<int>(func.start); i++)
                         {
                             uint32_t prevAddr = inst.address - i * 4;
@@ -437,12 +480,25 @@ namespace ps2recomp
                             // Check if it's a LUI instruction for the same register
                             if (OPCODE(prevInst) == OPCODE_LUI && RT(prevInst) == inst.rs)
                             {
-                                baseAddr = IMMEDIATE(prevInst) << 16;
+                                baseAddr = (IMMEDIATE(prevInst) << 16) + lowAdjust;
+                                break;
+                            }
+                            if ((OPCODE(prevInst) == OPCODE_ORI || OPCODE(prevInst) == OPCODE_ADDIU) &&
+                                RT(prevInst) == inst.rs && RS(prevInst) == inst.rs)
+                            {
+                                lowAdjust += (OPCODE(prevInst) == OPCODE_ORI)
+                                                 ? IMMEDIATE(prevInst)
+                                                 : static_cast<uint32_t>(static_cast<int16_t>(IMMEDIATE(prevInst)));
+                                continue;
+                            }
+                            if (writesGpr(prevInst, inst.rs))
+                            {
+                                baseClobbered = true;
                                 break;
                             }
                         }
 
-                        if (baseAddr != 0)
+                        if (baseAddr != 0 && !baseClobbered)
                         {
                             uint32_t targetAddr = baseAddr + static_cast<int16_t>(inst.immediate);
 

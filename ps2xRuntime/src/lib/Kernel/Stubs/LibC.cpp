@@ -1,9 +1,136 @@
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
 #include "Common.h"
 #include "LibC.h"
 #include "ps2_log.h"
 
 namespace ps2_stubs
 {
+
+// ---- cont.260 PS2X_STUB_PROF (default OFF, read-only): how much of "guest code" is actually
+// HLE STUB work. cont.259 measured guest-exclusive at 16.5-17.4 ms/frame and showed the emitted
+// per-instruction code is only ~10-15% of it -- but "guest exclusive" also contains the native C++
+// HLE stubs reached FROM guest code, which are not transliterated code at all. cont.250's profile
+// put memcpy+memmove at 10.0% LEAF of the EE thread, so this is the first suspect.
+// An env flag is fine here (unlike the compile-time PS2X_GPR_COUNT): these run orders of magnitude
+// less often than a GPR write, so the gate is not on the hottest path.
+namespace
+{
+    enum StubProfId {
+        SP_malloc,
+        SP_memalign,
+        SP_free,
+        SP_calloc,
+        SP_realloc,
+        SP_memcpy,
+        SP_memset,
+        SP_memclr,
+        SP_memmove,
+        SP_memcmp,
+        SP_strcpy,
+        SP_strncpy,
+        SP_strlen,
+        SP_strcmp,
+        SP_strncmp,
+        SP_strcat,
+        SP_strncat,
+        SP_strchr,
+        SP_strrchr,
+        SP_strstr,
+        SP_printf,
+        SP_sprintf,
+        SP_snprintf,
+        SP_puts,
+        SP_N
+    };
+    const char *const kStubProfName[SP_N] = {
+        "malloc",
+        "memalign",
+        "free",
+        "calloc",
+        "realloc",
+        "memcpy",
+        "memset",
+        "memclr",
+        "memmove",
+        "memcmp",
+        "strcpy",
+        "strncpy",
+        "strlen",
+        "strcmp",
+        "strncmp",
+        "strcat",
+        "strncat",
+        "strchr",
+        "strrchr",
+        "strstr",
+        "printf",
+        "sprintf",
+        "snprintf",
+        "puts",
+    };
+    const bool g_stubProf = []
+    { const char *e = std::getenv("PS2X_STUB_PROF"); return e && e[0] && e[0] != '0'; }();
+    const int g_stubProfEvery = []
+    { const char *e = std::getenv("PS2X_STUB_PROF_EVERY"); const int v = e && e[0] ? std::atoi(e) : 10; return v > 0 ? v : 10; }();
+    unsigned long long g_stubProfNs[SP_N] = {0}, g_stubProfN[SP_N] = {0};
+
+    void stubProfReport()
+    {
+        // Wall-clock gated, never call-gated (cont.251 lesson).
+        static std::chrono::steady_clock::time_point s_t0{}, s_last{};
+        const auto now = std::chrono::steady_clock::now();
+        if (s_t0.time_since_epoch().count() == 0)
+        {
+            s_t0 = s_last = now;
+            std::fprintf(stderr, "[stub:prof] active (PS2X_STUB_PROF=1, every %ds)\n", g_stubProfEvery);
+            return;
+        }
+        if (now - s_last < std::chrono::seconds(g_stubProfEvery))
+            return;
+        s_last = now;
+        const double wall = std::chrono::duration_cast<std::chrono::nanoseconds>(now - s_t0).count() / 1e9;
+        double tot = 0.0;
+        unsigned long long calls = 0ull;
+        for (int i = 0; i < SP_N; ++i) { tot += double(g_stubProfNs[i]) / 1e9; calls += g_stubProfN[i]; }
+        std::fprintf(stderr, "[stub:prof] wall=%.1fs TOTAL=%.2fs (%.1f%% of wall) calls=%llu | clock-overhead<=%.2fs\n",
+                     wall, tot, 100.0 * tot / wall, calls, double(calls) * 45.0 / 1e9);
+        int idx[SP_N];
+        for (int i = 0; i < SP_N; ++i) idx[i] = i;
+        for (int i = 0; i < SP_N; ++i)
+            for (int j = i + 1; j < SP_N; ++j)
+                if (g_stubProfNs[idx[j]] > g_stubProfNs[idx[i]]) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+        std::fprintf(stderr, "[stub:prof] ");
+        for (int k = 0; k < SP_N && k < 8; ++k)
+        {
+            const int i = idx[k];
+            if (g_stubProfNs[i] == 0ull) break;
+            std::fprintf(stderr, "%s=%.2fs/%lluc  ", kStubProfName[i], double(g_stubProfNs[i]) / 1e9,
+                         (unsigned long long)g_stubProfN[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+
+    struct StubProfScope
+    {
+        std::chrono::steady_clock::time_point t0;
+        int id;
+        explicit StubProfScope(int i) : id(i)
+        {
+            if (g_stubProf) t0 = std::chrono::steady_clock::now();
+        }
+        ~StubProfScope()
+        {
+            if (!g_stubProf) return;
+            g_stubProfNs[id] += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            ++g_stubProfN[id];
+            stubProfReport();
+        }
+    };
+}
+#define STUBPROF(id) StubProfScope stubProf__(id)
     namespace
     {
         uint32_t sanitizeMemTransferSize(uint32_t size, const char *op)
@@ -49,6 +176,7 @@ namespace ps2_stubs
 
     void malloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_malloc);
         const uint32_t size = getRegU32(ctx, 4); // $a0
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
         setReturnU32(ctx, guestAddr);
@@ -56,6 +184,7 @@ namespace ps2_stubs
 
     void memalign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_memalign);
         const uint32_t alignment = getRegU32(ctx, 4); // $a0
         const uint32_t size = getRegU32(ctx, 5);      // $a1
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size, alignment) : 0u;
@@ -64,6 +193,7 @@ namespace ps2_stubs
 
     void free(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_free);
         const uint32_t guestAddr = getRegU32(ctx, 4); // $a0
         if (runtime && guestAddr != 0u)
         {
@@ -73,6 +203,7 @@ namespace ps2_stubs
 
     void calloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_calloc);
         const uint32_t count = getRegU32(ctx, 4); // $a0
         const uint32_t size = getRegU32(ctx, 5);  // $a1
         const uint32_t guestAddr = runtime ? runtime->guestCalloc(count, size) : 0u;
@@ -81,6 +212,7 @@ namespace ps2_stubs
 
     void realloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_realloc);
         const uint32_t oldGuestAddr = getRegU32(ctx, 4); // $a0
         const uint32_t newSize = getRegU32(ctx, 5);      // $a1
         const uint32_t newGuestAddr = runtime ? runtime->guestRealloc(oldGuestAddr, newSize) : 0u;
@@ -89,6 +221,7 @@ namespace ps2_stubs
 
     void memcpy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_memcpy);
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -131,6 +264,7 @@ namespace ps2_stubs
 
     void memset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_memset);
         uint32_t destAddr = getRegU32(ctx, 4);       // $a0
         int value = (int)(getRegU32(ctx, 5) & 0xFF); // $a1 (char value)
         uint32_t size = getRegU32(ctx, 6);           // $a2
@@ -169,6 +303,7 @@ namespace ps2_stubs
 
     void memclr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_memclr);
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t size = getRegU32(ctx, 5);     // $a1
         size = sanitizeMemTransferSize(size, "memclr");
@@ -205,6 +340,7 @@ namespace ps2_stubs
 
     void memmove(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_memmove);
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -245,6 +381,7 @@ namespace ps2_stubs
 
     void memcmp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_memcmp);
         uint32_t ptr1Addr = getRegU32(ctx, 4); // $a0
         uint32_t ptr2Addr = getRegU32(ctx, 5); // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -271,6 +408,7 @@ namespace ps2_stubs
 
     void strcpy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strcpy);
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
 
@@ -296,6 +434,7 @@ namespace ps2_stubs
 
     void strncpy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strncpy);
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -321,6 +460,7 @@ namespace ps2_stubs
 
     void strlen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strlen);
         uint32_t strAddr = getRegU32(ctx, 4); // $a0
         const char *hostStr = reinterpret_cast<const char *>(getConstMemPtr(rdram, strAddr));
         size_t len = 0;
@@ -338,6 +478,7 @@ namespace ps2_stubs
 
     void strcmp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strcmp);
         uint32_t str1Addr = getRegU32(ctx, 4); // $a0
         uint32_t str2Addr = getRegU32(ctx, 5); // $a1
 
@@ -365,6 +506,7 @@ namespace ps2_stubs
 
     void strncmp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strncmp);
         uint32_t str1Addr = getRegU32(ctx, 4); // $a0
         uint32_t str2Addr = getRegU32(ctx, 5); // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -392,6 +534,7 @@ namespace ps2_stubs
 
     void strcat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strcat);
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
 
@@ -416,6 +559,7 @@ namespace ps2_stubs
 
     void strncat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strncat);
         uint32_t destAddr = getRegU32(ctx, 4); // $a0
         uint32_t srcAddr = getRegU32(ctx, 5);  // $a1
         uint32_t size = getRegU32(ctx, 6);     // $a2
@@ -441,6 +585,7 @@ namespace ps2_stubs
 
     void strchr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strchr);
         uint32_t strAddr = getRegU32(ctx, 4);            // $a0
         int char_code = (int)(getRegU32(ctx, 5) & 0xFF); // $a1 (char value)
 
@@ -467,6 +612,7 @@ namespace ps2_stubs
 
     void strrchr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strrchr);
         uint32_t strAddr = getRegU32(ctx, 4);            // $a0
         int char_code = (int)(getRegU32(ctx, 5) & 0xFF); // $a1 (char value)
 
@@ -493,6 +639,7 @@ namespace ps2_stubs
 
     void strstr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_strstr);
         uint32_t haystackAddr = getRegU32(ctx, 4); // $a0
         uint32_t needleAddr = getRegU32(ctx, 5);   // $a1
 
@@ -523,6 +670,7 @@ namespace ps2_stubs
 
     void printf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_printf);
         uint32_t format_addr = getRegU32(ctx, 4); // $a0
         const std::string formatOwned = readPs2CStringBounded(rdram, runtime, format_addr, 1024);
         int ret = -1;
@@ -564,6 +712,7 @@ namespace ps2_stubs
 
     void sprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_sprintf);
         uint32_t str_addr = getRegU32(ctx, 4);     // $a0
         uint32_t format_addr = getRegU32(ctx, 5);  // $a1
         constexpr size_t kSafeSprintfBytes = 256u; // Keep guest stack temporaries from being overwritten.
@@ -624,6 +773,7 @@ namespace ps2_stubs
 
     void snprintf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_snprintf);
         uint32_t str_addr = getRegU32(ctx, 4);    // $a0
         size_t size = getRegU32(ctx, 5);          // $a1
         uint32_t format_addr = getRegU32(ctx, 6); // $a2
@@ -670,6 +820,7 @@ namespace ps2_stubs
 
     void puts(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        STUBPROF(SP_puts);
         uint32_t strAddr = getRegU32(ctx, 4); // $a0
         const char *hostStr = reinterpret_cast<const char *>(getConstMemPtr(rdram, strAddr));
         int result = EOF;

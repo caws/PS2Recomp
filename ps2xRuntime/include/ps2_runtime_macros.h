@@ -2,6 +2,7 @@
 #define PS2_RUNTIME_MACROS_H
 #include <cstdint>
 #include <cmath>
+#include <algorithm>
 #include <cstring>
 #include <bit>
 #if defined(_MSC_VER)
@@ -152,17 +153,21 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 // Fast path: Direct RDRAM access (masked).
 // Slow path: Full runtime->Load/Store
 
-static inline bool Ps2FastRangeIsContiguous(uint32_t offset, uint32_t bytes)
+// ---- cont.317: every helper below is force-inlined. perf on the live game showed Ps2IsSpecialAddress,
+// Ps2FastRead32/Write32/64 and ps2TraceGuestWrite as SEPARATE SYMBOLS in the unity TUs (GCC's inliner
+// gives up inside the huge generated functions), so every guest load/store was 2-3 calls. Same code,
+// attribute only.
+static __attribute__((always_inline)) inline bool Ps2FastRangeIsContiguous(uint32_t offset, uint32_t bytes)
 {
     return offset <= (PS2_RAM_SIZE - bytes);
 }
 
-static inline uint8_t Ps2FastRead8(const uint8_t *rdram, uint32_t addr)
+static __attribute__((always_inline)) inline uint8_t Ps2FastRead8(const uint8_t *rdram, uint32_t addr)
 {
     return rdram[addr & PS2_RAM_MASK];
 }
 
-static inline uint16_t Ps2FastRead16(const uint8_t *rdram, uint32_t addr)
+static __attribute__((always_inline)) inline uint16_t Ps2FastRead16(const uint8_t *rdram, uint32_t addr)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint16_t)))
@@ -182,7 +187,7 @@ static inline uint16_t Ps2FastRead16(const uint8_t *rdram, uint32_t addr)
     return value;
 }
 
-static inline uint32_t Ps2FastRead32(const uint8_t *rdram, uint32_t addr)
+static __attribute__((always_inline)) inline uint32_t Ps2FastRead32(const uint8_t *rdram, uint32_t addr)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint32_t)))
@@ -202,7 +207,7 @@ static inline uint32_t Ps2FastRead32(const uint8_t *rdram, uint32_t addr)
     return value;
 }
 
-static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
+static __attribute__((always_inline)) inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint64_t)))
@@ -222,7 +227,7 @@ static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
     return value;
 }
 
-static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
+static __attribute__((always_inline)) inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
@@ -242,12 +247,12 @@ static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
     return value;
 }
 
-static inline void Ps2FastWrite8(uint8_t *rdram, uint32_t addr, uint8_t value)
+static __attribute__((always_inline)) inline void Ps2FastWrite8(uint8_t *rdram, uint32_t addr, uint8_t value)
 {
     rdram[addr & PS2_RAM_MASK] = value;
 }
 
-static inline void Ps2FastWrite16(uint8_t *rdram, uint32_t addr, uint16_t value)
+static __attribute__((always_inline)) inline void Ps2FastWrite16(uint8_t *rdram, uint32_t addr, uint16_t value)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint16_t)))
@@ -263,7 +268,7 @@ static inline void Ps2FastWrite16(uint8_t *rdram, uint32_t addr, uint16_t value)
     std::memcpy(rdram + offset, &value, sizeof(value));
 }
 
-static inline void Ps2FastWrite32(uint8_t *rdram, uint32_t addr, uint32_t value)
+static __attribute__((always_inline)) inline void Ps2FastWrite32(uint8_t *rdram, uint32_t addr, uint32_t value)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint32_t)))
@@ -279,7 +284,7 @@ static inline void Ps2FastWrite32(uint8_t *rdram, uint32_t addr, uint32_t value)
     std::memcpy(rdram + offset, &value, sizeof(value));
 }
 
-static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
+static __attribute__((always_inline)) inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(uint64_t)))
@@ -295,7 +300,7 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
     std::memcpy(rdram + offset, &value, sizeof(value));
 }
 
-static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+static __attribute__((always_inline)) inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 {
     const uint32_t offset = addr & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
@@ -604,6 +609,166 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
 // FPU (COP1) operations
+// ★★★ cont.230 EE FPU SEMANTICS (PS2X_FPU_EE, default 1; define it 0 to restore the plain-IEEE
+// macros for an A/B build). The R5900 FPU has no NaN, no Inf and no denormals: an operand with an
+// all-ones exponent READS as +-Fmax (0x7F7FFFFF) and one with a zero exponent as +-0; a result that
+// overflows clamps to +-Fmax and one that underflows flushes to +-0; DIV/RSQRT by a zero-or-denormal
+// divisor return +-Fmax (sign = xor of the operands) and raise D (or I for 0/0) + the sticky flag;
+// SQRT of a negative is sqrt(|x|); CVT.W.S truncates with saturation; MIN/MAX order by the SIGNED
+// BIT PATTERN. Mirrored from PCSX2 `FPU.cpp`: fpuDouble(), checkOverflow(), checkUnderflow(),
+// checkDivideByZero(), fp_min()/fp_max(), ADD_S..RSQRT_S, CVT_W, C_cond_S (the `#else` branch of
+// comparePrecision: exact compare on the clamped operands). Why it matters (LOTR, cont.230): the
+// collision grid's floor is built on cvt.w.s truncating, and before that, INFINITY from a divide by
+// zero and NaN from sqrt(negative) were free to propagate into game logic that on hardware sees
+// finite numbers. The cause/sticky FLAGS are modelled only where PCSX2 sets them on an early
+// return (divide-by-zero, RSQRT); the O/U/I flags of ordinary ops are not.
+#ifndef PS2X_FPU_EE
+#define PS2X_FPU_EE 1
+#endif
+#define FPU_FLAG_C  0x00800000u
+#define FPU_FLAG_I  0x00020000u
+#define FPU_FLAG_D  0x00010000u
+#define FPU_FLAG_O  0x00008000u
+#define FPU_FLAG_U  0x00004000u
+#define FPU_FLAG_SI 0x00000040u
+#define FPU_FLAG_SD 0x00000020u
+#define FPU_FLAG_SO 0x00000010u
+#define FPU_FLAG_SU 0x00000008u
+static inline uint32_t ps2FpuBits(float f) { uint32_t u; std::memcpy(&u, &f, sizeof(u)); return u; }
+static inline float ps2FpuFromBits(uint32_t u) { float f; std::memcpy(&f, &u, sizeof(f)); return f; }
+// ★★★ cont.230: the EE's CVT.W.S TRUNCATES toward zero (with saturation) -- it is what the SDK
+// compiler emits for a C `(int)` cast, and PCSX2 implements it as a plain C cast in the interpreter
+// (`FPU.cpp` `CVT_W`: `(s32)_FsValf_` when the exponent fits, else 0x7FFFFFFF / 0x80000000) and as
+// `cvttss2si` in the recompiler (`iFPU.cpp` `recCVT_W`). `nearbyintf` (round-to-nearest) was off by
+// one for every fraction above a half: LOTR's collision grid maps world coordinates to cells with a
+// floor built on this truncation (0x212920: CVT.W.S, minus one only for negatives), so the sweep
+// tested the wrong cells and Gandalf walked into rubble / fell through walkways.
+static inline int32_t ps2FpuCvtWS(float f)
+{
+    uint32_t u;
+    std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7F800000u) <= 0x4E800000u)
+        return (int32_t)f; // C truncation, exponent proven in range
+    return (u & 0x80000000u) ? (int32_t)0x80000000 : (int32_t)0x7FFFFFFF;
+}
+// PCSX2 fpuDouble(): how the FPU READS an operand.
+static inline float ps2FpuIn(float f)
+{
+    const uint32_t u = ps2FpuBits(f), e = u & 0x7F800000u;
+    if (e == 0u)
+        return ps2FpuFromBits(u & 0x80000000u);
+    if (e == 0x7F800000u)
+        return ps2FpuFromBits((u & 0x80000000u) | 0x7F7FFFFFu);
+    return f;
+}
+// PCSX2 checkOverflow() + checkUnderflow(): how the FPU WRITES a result.
+static inline float ps2FpuOut(float f)
+{
+    const uint32_t u = ps2FpuBits(f), e = u & 0x7F800000u;
+    if (e == 0x7F800000u)
+        return ps2FpuFromBits((u & 0x80000000u) | 0x7F7FFFFFu);
+    if (e == 0u)
+        return ps2FpuFromBits(u & 0x80000000u);
+    return f;
+}
+// PCSX2 DIV_S: checkDivideByZero (denormals count as zero; 0/0 raises I, x/0 raises D), then the
+// clamped quotient.
+static inline float ps2FpuDiv(R5900Context *ctx, float fs, float ft)
+{
+    const uint32_t us = ps2FpuBits(fs), ut = ps2FpuBits(ft);
+    if ((ut & 0x7F800000u) == 0u)
+    {
+        ctx->fcr31 |= ((us & 0x7F800000u) == 0u) ? (FPU_FLAG_I | FPU_FLAG_SI) : (FPU_FLAG_D | FPU_FLAG_SD);
+        return ps2FpuFromBits(((ut ^ us) & 0x80000000u) | 0x7F7FFFFFu);
+    }
+    return ps2FpuOut(ps2FpuIn(fs) / ps2FpuIn(ft));
+}
+// PCSX2 RSQRT_S: ft zero/denormal -> +-Fmax with ft's sign (D); negative ft -> fs/sqrt(|ft|) (I).
+static inline float ps2FpuRsqrt(R5900Context *ctx, float fs, float ft)
+{
+    const uint32_t ut = ps2FpuBits(ft);
+    if ((ut & 0x7F800000u) == 0u)
+    {
+        ctx->fcr31 |= FPU_FLAG_D | FPU_FLAG_SD;
+        return ps2FpuFromBits((ut & 0x80000000u) | 0x7F7FFFFFu);
+    }
+    if ((ut & 0x80000000u) != 0u)
+        ctx->fcr31 |= FPU_FLAG_I | FPU_FLAG_SI;
+    return ps2FpuOut(ps2FpuIn(fs) / sqrtf(fabsf(ps2FpuIn(ft))));
+}
+// PCSX2 SQRT_S: zero/denormal -> +-0; negative -> sqrt(|x|).
+static inline float ps2FpuSqrt(float ft)
+{
+    const uint32_t ut = ps2FpuBits(ft);
+    if ((ut & 0x7F800000u) == 0u)
+        return ps2FpuFromBits(ut & 0x80000000u);
+    return sqrtf(fabsf(ps2FpuIn(ft)));
+}
+// PCSX2 fp_max()/fp_min(): signed-bit-pattern ordering (both negative -> the reverse).
+static inline float ps2FpuMax(float a, float b)
+{
+    const int32_t ia = (int32_t)ps2FpuBits(a), ib = (int32_t)ps2FpuBits(b);
+    return ((ia < 0 && ib < 0) ? (ia < ib) : (ia > ib)) ? a : b;
+}
+static inline float ps2FpuMin(float a, float b)
+{
+    const int32_t ia = (int32_t)ps2FpuBits(a), ib = (int32_t)ps2FpuBits(b);
+    return ((ia < 0 && ib < 0) ? (ia > ib) : (ia < ib)) ? a : b;
+}
+#if PS2X_FPU_EE
+#define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
+#define FPU_ADD_S(a, b) ps2FpuOut(ps2FpuIn((float)(a)) + ps2FpuIn((float)(b)))
+#define FPU_SUB_S(a, b) ps2FpuOut(ps2FpuIn((float)(a)) - ps2FpuIn((float)(b)))
+#define FPU_MUL_S(a, b) ps2FpuOut(ps2FpuIn((float)(a)) * ps2FpuIn((float)(b)))
+#define FPU_DIV_S(a, b) ps2FpuOut(ps2FpuIn((float)(a)) / ps2FpuIn((float)(b)))
+#define FPU_DIV_S_EE(ctx, a, b) ps2FpuDiv(ctx, (float)(a), (float)(b))
+#define FPU_RSQRT_S_EE(ctx, a, b) ps2FpuRsqrt(ctx, (float)(a), (float)(b))
+#define FPU_SQRT_S(a) ps2FpuSqrt((float)(a))
+#define FPU_ABS_S(a) fabsf((float)(a))
+#define FPU_MOV_S(a) ((float)(a))
+#define FPU_NEG_S(a) (-(float)(a))
+#define FPU_MAX_S(a, b) ps2FpuMax((float)(a), (float)(b))
+#define FPU_MIN_S(a, b) ps2FpuMin((float)(a), (float)(b))
+#define FPU_ROUND_L_S(a) ((int64_t)roundf((float)(a)))
+#define FPU_TRUNC_L_S(a) ((int64_t)(float)(a))
+#define FPU_CEIL_L_S(a) ((int64_t)ceilf((float)(a)))
+#define FPU_FLOOR_L_S(a) ((int64_t)floorf((float)(a)))
+#define FPU_ROUND_W_S(a) ((int32_t)nearbyintf((float)(a)))
+#define FPU_TRUNC_W_S(a) ps2FpuCvtWS((float)(a))
+#define FPU_CEIL_W_S(a) ((int32_t)ceilf((float)(a)))
+#define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+#define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+#define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+#define FPU_CVT_W_S(a) ps2FpuCvtWS((float)(a))
+#define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+// Compares: the EE has no unordered case, so every variant reduces to the ordered one on the
+// clamped operands (a NaN/Inf bit pattern compares as +-Fmax, a denormal as +-0).
+#define FPU_C_F_S(a, b) (0)
+#define FPU_C_UN_S(a, b) (0)
+#define FPU_C_EQ_S(a, b) (ps2FpuIn((float)(a)) == ps2FpuIn((float)(b)))
+#define FPU_C_UEQ_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_OLT_S(a, b) (ps2FpuIn((float)(a)) < ps2FpuIn((float)(b)))
+#define FPU_C_ULT_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_OLE_S(a, b) (ps2FpuIn((float)(a)) <= ps2FpuIn((float)(b)))
+#define FPU_C_ULE_S(a, b) FPU_C_OLE_S(a, b)
+#define FPU_C_SF_S(a, b) (0)
+#define FPU_C_NGLE_S(a, b) (0)
+#define FPU_C_SEQ_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_NGL_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_LT_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_NGE_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_LE_S(a, b) FPU_C_OLE_S(a, b)
+#define FPU_C_NGT_S(a, b) FPU_C_OLE_S(a, b)
+#else // PS2X_FPU_EE == 0: the plain-IEEE macros as they were (A/B reference), plus the helper
+      // macros the translator now emits, reproducing the old inline DIV/RSQRT/MIN/MAX exactly.
+static inline float ps2FpuDivLegacy(R5900Context *ctx, float fs, float ft)
+{ if (ft == 0.0f) { ctx->fcr31 |= 0x100000; return copysignf(INFINITY, fs * 0.0f); } return fs / ft; }
+static inline float ps2FpuRsqrtLegacy(R5900Context *ctx, float fs, float ft)
+{ if (ft == 0.0f) { ctx->fcr31 |= 0x100000; return copysignf(INFINITY, fs); } return fs / sqrtf(fabsf(ft)); }
+#define FPU_DIV_S_EE(ctx, a, b) ps2FpuDivLegacy(ctx, (float)(a), (float)(b))
+#define FPU_RSQRT_S_EE(ctx, a, b) ps2FpuRsqrtLegacy(ctx, (float)(a), (float)(b))
+#define FPU_MAX_S(a, b) std::max((float)(a), (float)(b))
+#define FPU_MIN_S(a, b) std::min((float)(a), (float)(b))
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
 #define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
 #define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
@@ -623,7 +788,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+#define FPU_CVT_W_S(a) ps2FpuCvtWS((float)(a))   /* the cont.230 truncation fix is kept in both branches */
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
@@ -641,6 +806,7 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
 #define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
 #define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#endif // PS2X_FPU_EE
 
 // QFSRV: Quadword Funnel Shift Right Variable
 // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
@@ -739,10 +905,23 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 #define GPR_S64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0LL : PS2_EXTRACT_EPI64_0(ctx_ptr->r[reg_idx]))
 #define GPR_VEC(ctx_ptr, reg_idx) ((reg_idx == 0) ? _mm_setzero_si128() : ctx_ptr->r[reg_idx])
 
+// ---- cont.259 PS2X_GPR_COUNT: dynamic count of scalar GPR writes (the calibration the
+// guest-code budget needs). ★ COMPILE-TIME on purpose, against the usual env-var rule: this sits
+// on the hottest path in the build (every SET_GPR_* funnels here), so a runtime `if` would tax the
+// DEFAULT build for every user and perturb the very cost being measured. Build one throwaway
+// binary with -DPS2X_GPR_COUNT (or a temporary #define here), read `gprWr=` off [ee:guest], and
+// throw it away. Never define it for a timing or play build.
+#ifdef PS2X_GPR_COUNT
+extern unsigned long long g_ps2GprWrites;
+#endif
+
 static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
 {
     if (reg != 0)
     {
+#ifdef PS2X_GPR_COUNT
+        ++g_ps2GprWrites;
+#endif
         ctx->r[reg] = _mm_castpd_si128(_mm_move_sd(_mm_castsi128_pd(ctx->r[reg]), _mm_castsi128_pd(new_low)));
     }
 }

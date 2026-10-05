@@ -1,5 +1,43 @@
 #include "runtime/ps2_vu1.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <climits>
 #include "ps2_vu1_detail.h"
+#include "ps2_vu1_jit.h"
+
+// FTOI saturation trap (PS2X_VU1_FTOITRAP, default OFF): the level-era garbage cascade carries
+// saturated-int fingerprints; name the FIRST saturating FTOIs (program pc + input bits).
+static void logFtoiSaturation(uint32_t pc, unsigned long long cycle, float input, int component, float scale,
+                              const uint8_t *code, uint32_t codeSize)
+{
+    static const bool s_on = []
+    { const char *e = std::getenv("PS2X_VU1_FTOITRAP"); return e && e[0] && e[0] != '0'; }();
+    if (!s_on)
+        return;
+    static unsigned long s_n = 0;
+    ++s_n;
+    if (s_n <= 24u || (s_n % 65536u) == 0u)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &input, 4);
+        std::fprintf(stderr, "[VU1 ftoi-sat] n=%lu pc=0x%x cycle=%llu in=0x%08x(%g) c=%d scale=%g\n",
+                     s_n, pc, cycle, bits, input, component, scale);
+        if (s_n == 1u && code)
+        {
+            const uint32_t base = (pc >= 24u) ? (pc - 24u) & ~7u : 0u;
+            for (uint32_t off = 0; off < 48u && base + off + 8u <= codeSize; off += 8u)
+            {
+                uint32_t lo = 0, hi = 0;
+                std::memcpy(&lo, code + base + off, 4u);
+                std::memcpy(&hi, code + base + off + 4u, 4u);
+                std::fprintf(stderr, "    code 0x%04x: upper=%08x lower=%08x%s\n",
+                             base + off, hi, lo, (base + off == pc) ? "  <= ftoi" : "");
+            }
+        }
+    }
+}
+
 
 #include <cmath>
 #include <cstring>
@@ -24,21 +62,117 @@ namespace
 void VU1Interpreter::execUpper(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
+
+    // cont.183: JIT fast path. The compiled function reproduces exactly what this routine plus
+    // applyFmacDest(Acc) do for the covered FMAC ops — operand clamp, broadcast, arithmetic,
+    // result clamp, dest-lane blend, store — so everything else (the write pipeline, run()'s
+    // shadow dance, cycle accounting, the lower instruction) is untouched. Only valid while lazy
+    // flags is active, because the emitted code deliberately derives no MAC/status flags.
+    if (vu1jit::enabled() && vu1jit::lazyActive() && !vu1jit::inVerify())
+    {
+        if (vu1jit::UpperFn fn = vu1jit::lookup(instr))
+        {
+            if (!vu1jit::verifyMode())
+            {
+                fn(&m_state);
+                return;
+            }
+            // Shadow verify against live guest data: run the JIT, capture what it wrote, restore,
+            // then re-enter this function with the JIT suppressed so the interpreter produces the
+            // authoritative result, and compare. The recursion guard is what makes "run both" work
+            // without duplicating the whole opcode switch.
+            const uint8_t jd = FD(instr);
+            alignas(16) float savedVf[4], savedAcc[4], jitVf[4], jitAcc[4];
+            std::memcpy(savedVf, m_state.vf[jd], sizeof(savedVf));
+            std::memcpy(savedAcc, m_state.acc, sizeof(savedAcc));
+            fn(&m_state);
+            std::memcpy(jitVf, m_state.vf[jd], sizeof(jitVf));
+            std::memcpy(jitAcc, m_state.acc, sizeof(jitAcc));
+            std::memcpy(m_state.vf[jd], savedVf, sizeof(savedVf));
+            std::memcpy(m_state.acc, savedAcc, sizeof(savedAcc));
+
+            vu1jit::inVerify() = true;
+            execUpper(instr); // authoritative interpreter result
+            vu1jit::inVerify() = false;
+
+            vu1jit::noteVerify(instr, jitVf, jitAcc, m_state.vf[jd], m_state.acc);
+            return;
+        }
+    }
+
     uint8_t dest = DEST(instr);
     uint8_t ft = FT(instr);
     uint8_t fs = FS(instr);
     uint8_t fd = FD(instr);
     uint8_t op = instr & 0x3F;
 
+    // PS2X_VU1_FASTUPPER (cont.178; default ON, "=0" reverts): this prologue used to normalise
+    // FOURTEEN floats — vs[4], vt[4], acc[4], q and i — unconditionally, before even looking at
+    // the opcode. The cont.178 profile put normalizeOperand at 10% of the EE thread (plus
+    // fmacNormOperand 4%), and the cont.178 opcode census showed **26.4% of all executed pairs
+    // have NO upper operation at all** (special 0x2F/0x30 = NOP), so a quarter of that work was
+    // being done for instructions that return immediately below. Two skips, both bit-exact
+    // because the skipped values are provably never read:
+    //   (1) upper NOP returns before the prologue entirely;
+    //   (2) acc is normalised only for the ops that READ it — exactly the MADD/MSUB product-sum
+    //       family, the same predicate calculateFmacProductSticky already uses (the only `acc[c]`
+    //       readers in this file are those cases, verified by inspection of every use).
+    // Levels (default 2 = both skips on): 0 = off (old behaviour, for A/B), 1 = NOP skip only,
+    // 2 = NOP + acc skip. The split levels exist because a single dark screenshot briefly looked
+    // like a geometry regression here; it was NOT — a faster build simply sits at a DIFFERENT game
+    // moment at the same wall-clock offset, and a longer burst rendered a fully detailed scene.
+    // Keep the levels: they make that kind of question answerable inside one binary.
+    // Both skips are sound by construction, verified mechanically against every case label:
+    //   - the only `acc[...]` readers in this file are exactly {0x08-0x0F, 0x21, 0x23, 0x25, 0x27,
+    //     0x29, 0x2D, 0x2E} in the main switch and {0x08-0x0F, 0x21, 0x23, 0x25, 0x27, 0x29, 0x2D}
+    //     in the special switch — an exact match for `readsAcc` below;
+    //   - the special 0x2F/0x30 (NOP) case body is a bare `return`, and the prologue it now skips
+    //     writes nothing but locals (m_currentUpperInstruction is assigned above it).
+    static const int s_fastUpper = []
+    { const char *e = std::getenv("PS2X_VU1_FASTUPPER"); return (e && e[0]) ? std::atoi(e) : 2; }();
+
+    const uint8_t specialOp = op >= 0x3Cu
+                                  ? static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu))
+                                  : 0xFFu;
+    if (s_fastUpper >= 1 && (specialOp == 0x2Fu || specialOp == 0x30u))
+        return; // NOP: nothing below reads vs/vt/acc/q/i
+
+    const bool readsAcc =
+        s_fastUpper < 2 ||
+        (op >= 0x08u && op <= 0x0Fu) ||
+        op == 0x21u || op == 0x23u || op == 0x25u || op == 0x27u ||
+        op == 0x29u || op == 0x2Du || op == 0x2Eu ||
+        (specialOp >= 0x08u && specialOp <= 0x0Fu) ||
+        specialOp == 0x21u || specialOp == 0x23u || specialOp == 0x25u ||
+        specialOp == 0x27u || specialOp == 0x29u || specialOp == 0x2Du;
+
+    // PS2X_VU1_SIMD (cont.181, default ON): the operand clamp is a pure function of each lane's
+    // bits (cont.180), so the whole quad is one SSE sequence instead of four scalar calls with
+    // their memcpy round-trips. Bit-identical to normalizeOperand by construction — same masks,
+    // same order of tests — and `=0` keeps the scalar loop reachable for A/B in one binary.
+    static const bool s_simd = []
+    { const char *e = std::getenv("PS2X_VU1_SIMD"); return !(e && e[0] == '0'); }();
+
     float *vd = m_state.vf[fd];
-    float normalizedVs[4];
-    float normalizedVt[4];
-    float normalizedAcc[4];
-    for (uint32_t component = 0; component < 4u; ++component)
+    alignas(16) float normalizedVs[4];
+    alignas(16) float normalizedVt[4];
+    alignas(16) float normalizedAcc[4];
+    if (s_simd)
     {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+        vuNormOperandQuad(m_state.vf[fs], normalizedVs);
+        vuNormOperandQuad(m_state.vf[ft], normalizedVt);
+        if (readsAcc)
+            vuNormOperandQuad(m_state.acc, normalizedAcc);
+    }
+    else
+    {
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+            normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+            if (readsAcc)
+                normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
+        }
     }
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
@@ -328,6 +462,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
             for (int c = 0; c < 4; c++)
             {
                 int32_t iv = vuFloatToInt(vs[c], 1.0f);
+                if (iv == INT32_MAX || iv == INT32_MIN)
+                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 1.0f, m_cachedVuCode, m_cachedCodeSize);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);
@@ -336,6 +472,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
             for (int c = 0; c < 4; c++)
             {
                 int32_t iv = vuFloatToInt(vs[c], 16.0f);
+                if (iv == INT32_MAX || iv == INT32_MIN)
+                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 16.0f, m_cachedVuCode, m_cachedCodeSize);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);
@@ -344,6 +482,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
             for (int c = 0; c < 4; c++)
             {
                 int32_t iv = vuFloatToInt(vs[c], 4096.0f);
+                if (iv == INT32_MAX || iv == INT32_MIN)
+                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 4096.0f, m_cachedVuCode, m_cachedCodeSize);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);
@@ -352,6 +492,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
             for (int c = 0; c < 4; c++)
             {
                 int32_t iv = vuFloatToInt(vs[c], 32768.0f);
+                if (iv == INT32_MAX || iv == INT32_MIN)
+                    logFtoiSaturation(m_state.pc, static_cast<unsigned long long>(m_cycle), vs[c], c, 32768.0f, m_cachedVuCode, m_cachedCodeSize);
                 std::memcpy(&result[c], &iv, 4);
             }
             applyDest(vtDest, result, dest);

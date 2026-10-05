@@ -1,9 +1,12 @@
+#include "runtime/ps2_gs_pipeline.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -111,6 +114,20 @@ GS::GS()
     reset();
 }
 
+// ★★★ rotk row 258 PS2X_GS_VTXRING (default ON; `=0` = shift the queue by copying, as before): the vertex queue is
+// a RING. Logical vertex i lives in slot (s_vtxBase + i) % kMaxVerts; a strip drops its oldest vertex by advancing the
+// base instead of copying the survivors down. WHY: the copies `m_vtxQueue[0] = m_vtxQueue[1] ...` read 40-byte
+// vertices with 16-byte loads right after writeRegisterPacked wrote them field by field (1/2/4-byte stores) -- the
+// store-to-load forwarding fails and the load waits for the stores to retire. perf annotate (GsPipeline, 60-fps fight):
+// 63% of GS::vertexKick's samples on that one copy. Exact: the same vertices, in the same order, reach every reader
+// (buildDrawBatch, the draw debug event). A fan still copies (it keeps vertex 0 and drops vertex 1).
+// The base is file-scope, not a GS member, because gs_frontend.h reaches the generated code (a member = a full rebuild);
+// one GS per process.
+static int s_vtxBase = 0;
+static const bool s_vtxRing = []
+{ const char *e = std::getenv("PS2X_GS_VTXRING"); return !(e && e[0] == '0'); }();
+#define GS_VSLOT(i) ((s_vtxBase + (i)) % kMaxVerts)
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     m_localMemoryStorage = vram;
@@ -156,13 +173,14 @@ void GS::reset()
     m_trxdir = 3;
     m_vtxCount = 0;
     m_vtxIndex = 0;
+    s_vtxBase = 0;
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
     if (m_backend)
     {
         m_backend->Flush();
-        m_backend->Sync(GSSyncReason::Reset);
+        ps2gs::fence(2); /* cont.317 stage 2 */ m_backend->Sync(GSSyncReason::Reset);
         m_backend->Reset();
     }
     {
@@ -204,7 +222,7 @@ void GS::snapshotVRAM()
     if (!m_backend)
         return;
     std::vector<uint8_t> snapshot;
-    m_backend->Sync(GSSyncReason::DebugReadback);
+    ps2gs::fence(3); /* cont.317 stage 2 */ m_backend->Sync(GSSyncReason::DebugReadback);
     m_backend->SnapshotVram(snapshot);
     std::lock_guard<std::mutex> lock(m_snapshotMutex);
     m_displaySnapshot.swap(snapshot);
@@ -350,8 +368,104 @@ void GS::recordDebugEventUnlocked(GSDebugHistoryEntry entry)
     }
 }
 
+// ---- GIF traffic census (PS2X_GIF_CENSUS, default OFF; read-only). cont.253: the EE submits
+// ~11 MB of GIF bytes per frame (49 GB over a 300 s run, cont.252) and that traffic IS the
+// rasterizer's input, so it costs on BOTH sides of the budget. Before optimising a memory-bound
+// path, find out what is in it and whether any of it is removable. This counts, per GIF tag and
+// per register write, on the runtime's OWN resumable decode (never a parallel re-walk -- a tag's
+// payload legally spans submission boundaries and a naive walk desyncs).
+// The headline number is REDUNDANT register writes: a write whose value is identical to the value
+// already held by that register is pure waste on both the EE and the raster side.
+// All state is file-static here on purpose: gs_frontend.h is included by the generated code, so
+// touching it would recompile all ~100 unity units.
+// Counters are relaxed atomics; the last-value table is plain (parse is path-serialised, and a
+// race would only perturb the redundancy estimate, which is diagnostic).
+namespace
+{
+    const bool s_gifCensus = []
+    { const char *e = std::getenv("PS2X_GIF_CENSUS"); return e && e[0] && e[0] != '0'; }();
+    const int s_gifCensusEvery = []
+    { const char *e = std::getenv("PS2X_GIF_CENSUS_EVERY"); const int v = e && e[0] ? std::atoi(e) : 10; return v > 0 ? v : 10; }();
+
+    std::atomic<unsigned long long> g_gcTags[4]{};       // by FLG: PACKED/REGLIST/IMAGE/disable
+    std::atomic<unsigned long long> g_gcNloop[4]{};
+    std::atomic<unsigned long long> g_gcBytes[4]{};      // payload bytes implied by the tag
+    std::atomic<unsigned long long> g_gcTagsNoLoop{0};   // NLOOP==0 tags (PRIM-only / NOP)
+    std::atomic<unsigned long long> g_gcRegW{0}, g_gcRegRedundant{0};
+    std::atomic<unsigned long long> g_gcRegWPer[256]{}, g_gcRegRedPer[256]{};
+    uint64_t g_gcLastVal[256]{};
+    bool g_gcLastValSet[256]{};
+
+    void gifCensusTag(uint32_t nloop, uint8_t flg, uint32_t nreg)
+    {
+        const uint32_t f = flg & 3u;
+        g_gcTags[f].fetch_add(1, std::memory_order_relaxed);
+        if (nloop == 0u)
+        {
+            g_gcTagsNoLoop.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        g_gcNloop[f].fetch_add(nloop, std::memory_order_relaxed);
+        unsigned long long bytes = 0;
+        if (f == 0u)        // PACKED: nloop x nreg x 16
+            bytes = 16ull * nloop * nreg;
+        else if (f == 1u)   // REGLIST: nloop x nreg x 8, qword-padded
+            bytes = ((8ull * nloop * nreg) + 15ull) & ~15ull;
+        else if (f == 2u)   // IMAGE: nloop x 16
+            bytes = 16ull * nloop;
+        g_gcBytes[f].fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    void gifCensusReport()
+    {
+        static std::chrono::steady_clock::time_point s_t0{}, s_last{};
+        const auto now = std::chrono::steady_clock::now();
+        if (s_t0.time_since_epoch().count() == 0)
+        {
+            s_t0 = s_last = now;
+            std::fprintf(stderr, "[gif:census] active (PS2X_GIF_CENSUS=1, every %ds)\n", s_gifCensusEvery);
+            return;
+        }
+        if (now - s_last < std::chrono::seconds(s_gifCensusEvery))
+            return;
+        s_last = now;
+        const double wall = std::chrono::duration_cast<std::chrono::nanoseconds>(now - s_t0).count() / 1e9;
+        const unsigned long long rw = g_gcRegW.load(std::memory_order_relaxed);
+        const unsigned long long rr = g_gcRegRedundant.load(std::memory_order_relaxed);
+        static const char *kName[4] = {"packed", "reglist", "image", "disable"};
+        std::fprintf(stderr, "[gif:census] wall=%.1fs | tags", wall);
+        for (int i = 0; i < 4; ++i)
+            std::fprintf(stderr, " %s=%llu(nloop=%llu, %.1fMB)", kName[i],
+                         g_gcTags[i].load(std::memory_order_relaxed),
+                         g_gcNloop[i].load(std::memory_order_relaxed),
+                         double(g_gcBytes[i].load(std::memory_order_relaxed)) / 1048576.0);
+        std::fprintf(stderr, " noloop=%llu\n", g_gcTagsNoLoop.load(std::memory_order_relaxed));
+        std::fprintf(stderr, "[gif:census] reg writes=%llu REDUNDANT=%llu (%.1f%%) | worst redundant regs:",
+                     rw, rr, rw ? 100.0 * double(rr) / double(rw) : 0.0);
+        // the five registers wasting the most writes
+        unsigned idx[256];
+        for (unsigned i = 0; i < 256u; ++i) idx[i] = i;
+        std::partial_sort(idx, idx + 5, idx + 256, [](unsigned a, unsigned b)
+                          { return g_gcRegRedPer[a].load(std::memory_order_relaxed) >
+                                   g_gcRegRedPer[b].load(std::memory_order_relaxed); });
+        for (int k = 0; k < 5; ++k)
+        {
+            const unsigned long long red = g_gcRegRedPer[idx[k]].load(std::memory_order_relaxed);
+            if (!red) break;
+            const unsigned long long tot = g_gcRegWPer[idx[k]].load(std::memory_order_relaxed);
+            std::fprintf(stderr, " %02x:%llu/%llu(%.0f%%)", idx[k], red, tot, tot ? 100.0 * double(red) / double(tot) : 0.0);
+        }
+        std::fprintf(stderr, "\n");
+    }
+} // namespace
+
 void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg)
 {
+    if (s_gifCensus)
+    {
+        gifCensusTag(nloop, flg, nreg);
+        gifCensusReport();
+    }
     if (m_debugHistoryPaused)
     {
         return;
@@ -424,14 +538,15 @@ void GS::recordDrawDebugEventUnlocked(int vertexCount)
     entry.vertexCount = static_cast<uint32_t>(vertexCount);
 
     const int count = std::min(vertexCount, kMaxVerts);
-    entry.xMin = entry.xMax = m_vtxQueue[0].x;
-    entry.yMin = entry.yMax = m_vtxQueue[0].y;
-    entry.zMin = entry.zMax = m_vtxQueue[0].z;
-    entry.aMin = entry.aMax = m_vtxQueue[0].a;
+    const GSVertex &v0 = m_vtxQueue[GS_VSLOT(0)];
+    entry.xMin = entry.xMax = v0.x;
+    entry.yMin = entry.yMax = v0.y;
+    entry.zMin = entry.zMax = v0.z;
+    entry.aMin = entry.aMax = v0.a;
 
     for (int i = 1; i < count; ++i)
     {
-        const GSVertex &v = m_vtxQueue[i];
+        const GSVertex &v = m_vtxQueue[GS_VSLOT(i)];
         entry.xMin = std::min(entry.xMin, v.x);
         entry.xMax = std::max(entry.xMax, v.x);
         entry.yMin = std::min(entry.yMin, v.y);
@@ -638,6 +753,63 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+namespace
+{
+struct GifParseState
+{
+    uint32_t active = 0u;   // 0 = idle; 1 = mid-tag, resume on this path's next packet
+    uint8_t flg = 0u;
+    uint32_t nreg = 0u;
+    uint8_t regs[16] = {};
+    uint32_t regIndex = 0u;   // PACKED/REGLIST: next reg slot
+    uint32_t loopsLeft = 0u;  // PACKED: loops remaining (current partial loop included)
+    uint32_t regsLeft = 0u;   // REGLIST: registers remaining
+    bool padPending = false;  // REGLIST: odd reg total -> trailing 8-byte alignment slot
+    uint32_t imageQwLeft = 0u; // IMAGE/IMAGE2: data qwords remaining
+    float q = 1.0f;           // saved m_curQ across the boundary
+    // Seed diagnostics (cont.156): what preceded the current tag read, to attribute desyncs.
+    uint8_t lastEvent = 0u;    // 0 none, 1 image-completed, 2 packed-completed, 3 reglist-completed
+    uint32_t lastEventOff = 0u; // offset just after that completion (same packet)
+    uint8_t lastEventResumed = 0u; // the completed tag had crossed a packet boundary
+    uint32_t lastImgNloop = 0u; // the completed image's declared nloop
+};
+GifParseState g_gifParseState[4];
+uint32_t g_gifActivePath = 3u;
+const bool s_gifResume = []
+{ const char *e = std::getenv("PS2X_GIF_RESUME"); return !(e && e[0] == '0'); }();
+} // namespace
+
+// Called by the GIF arbiter (and the XGKICK fallback) right before each packet is handed to
+// processGIFPacket, so the parser resumes the correct path's suspended tag. Extern "C" free
+// function on purpose: no header change (headers reach the generated code -> full rebuild).
+extern "C" void ps2xGsSetGifPath(uint32_t path)
+{
+    g_gifActivePath = path < 4u ? path : 3u;
+}
+// cont.317 pipeline oracle: is every path's parser idle (no tag suspended across packets)?
+extern "C" int ps2xGsGifParseQuiescent()
+{
+    for (const auto &s : g_gifParseState)
+        if (s.active != 0u || s.imageQwLeft != 0u || s.padPending)
+            return 0;
+    return 1;
+}
+extern "C" void ps2xGsGifParseReset()
+{
+    for (auto &s : g_gifParseState)
+        s = GifParseState{};
+    g_gifActivePath = 3u;
+}
+// cont.230: primitives drawn per GIF path (1 = XGKICK, 2 = VIF DIRECT, 3 = DMA), for the throughput
+// line -- separates "the VU produced fewer primitives" from "the EE-side paths did".
+extern "C" unsigned long long ps2xGsPathPrims[4] = {0, 0, 0, 0};
+
+void GS::endPacket()
+{
+    if (m_backend)
+        m_backend->EndPacket();
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -668,71 +840,184 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         }
     });
 
+    // One-shot tag-walk dump (PS2X_GIF_WALKDUMP=<pktsize>): print every tag of the FIRST
+    // packet whose sizeBytes matches, to find where the walk desyncs into image data.
+    static const long s_walkDumpSize = []
+    { const char *e = std::getenv("PS2X_GIF_WALKDUMP"); return e ? std::atol(e) : -1; }();
+    static bool s_walkDumpDone = false;
+    const bool walkDump = !s_walkDumpDone && s_walkDumpSize >= 0 &&
+                          sizeBytes == static_cast<uint32_t>(s_walkDumpSize);
+    if (walkDump)
+        s_walkDumpDone = true;
+    uint32_t walkLines = 0;
+
+    // Per-path resumable parse (PS2X_GIF_RESUME, default ON; PCSX2 Gif_Path parity): a GIF
+    // tag's payload legally spans DMA/DIRECT submission boundaries, so the parser keeps the
+    // active tag (format, loops left, reg cursor, image remainder) PER PATH and resumes it on
+    // the path's next packet. The old stateless per-packet parse dropped a split tag's tail
+    // and re-read the next packet's mid-payload bytes as tags -> garbage register writes
+    // (the movie-era 200944-byte packets misparsed from byte 0, cont.156).
+    GifParseState &ps = g_gifParseState[g_gifActivePath & 3u];
+    if (!s_gifResume)
+        ps.active = 0u;
+    ps.lastEventResumed = ps.active ? 1u : 0u;
+    ps.lastEvent = 0u;
+    if (ps.active)
+        m_curQ = ps.q;
+
     uint32_t offset = 0;
-    while (offset + 16 <= sizeBytes)
+    for (;;)
     {
-        uint64_t tagLo = loadLE64(data + offset);
-        uint64_t tagHi = loadLE64(data + offset + 8);
-        offset += 16;
-
-        m_curQ = 1.0f;
-
-        uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
-        uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
-        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
-        if (nreg == 0)
-            nreg = 16;
-
-        recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
-
-        bool pre = ((tagLo >> 46) & 1) != 0;
-        if (pre)
+        if (!ps.active)
         {
-            writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+            if (offset + 16 > sizeBytes)
+                break;
+            const uint64_t tagLo = loadLE64(data + offset);
+            const uint64_t tagHi = loadLE64(data + offset + 8);
+            if (walkDump && walkLines < 220u)
+            {
+                ++walkLines;
+                std::fprintf(stderr, "[gif:walk] off=%u lo=%016llx hi=%016llx nloop=%u flg=%u nreg=%u\n",
+                             offset,
+                             static_cast<unsigned long long>(tagLo),
+                             static_cast<unsigned long long>(tagHi),
+                             static_cast<uint32_t>(tagLo & 0x7FFF),
+                             static_cast<uint32_t>((tagLo >> 58) & 0x3),
+                             static_cast<uint32_t>((tagLo >> 60) & 0xF) ? static_cast<uint32_t>((tagLo >> 60) & 0xF) : 16u);
+            }
+            offset += 16;
+
+            m_curQ = 1.0f;
+
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFF);
+            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
+            if (nreg == 0)
+                nreg = 16;
+
+            recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+
+            const bool pre = ((tagLo >> 46) & 1) != 0;
+            if (pre)
+                writeRegisterUnlocked(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
+
+            if (nloop == 0u)
+                continue; // tag with no payload (NOP / PRIM-only)
+
+            ps.flg = flg;
+            ps.nreg = nreg;
+            for (uint32_t i = 0; i < 16u; ++i)
+                ps.regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
+            ps.regIndex = 0u;
+            if (flg == GIF_FMT_PACKED)
+            {
+                ps.loopsLeft = nloop;
+            }
+            else if (flg == GIF_FMT_REGLIST)
+            {
+                ps.regsLeft = nloop * nreg;
+                ps.padPending = (ps.regsLeft & 1u) != 0u;
+            }
+            else // IMAGE (flg=2) or flg=3 "Disable" == IMAGE2: both carry nloop data qwords
+            {    // (ps2tek; PCSX2 GIFPath shares one case for GIF_FLG_IMAGE/IMAGE2)
+                ps.imageQwLeft = nloop;
+                ps.lastImgNloop = nloop;
+            }
+            // Seed probe: an implausible tag right after a completion attributes the desync.
+            {
+                static const bool s_seedLog = []
+                { const char *e = std::getenv("PS2X_GIF_SEEDLOG"); return e && e[0] && e[0] != '0'; }();
+                const bool implausible =
+                    (flg == GIF_FMT_PACKED && nloop > 0x4000u && nreg > 8u) ||
+                    (flg == GIF_FMT_REGLIST && nloop > 0x4000u && nreg > 8u);
+                if (s_seedLog && implausible)
+                {
+                    static unsigned long s_n = 0;
+                    ++s_n;
+                    if (s_n <= 40u || (s_n % 1024u) == 0u)
+                        std::fprintf(stderr,
+                                     "[gif:seed] #%lu path=%u off=%u pkt=%u tag{flg=%u nloop=%u nreg=%u} "
+                                     "prev{ev=%u off=%u resumed=%u imgNloop=%u} lo=%016llx\n",
+                                     s_n, g_gifActivePath, offset - 16u, sizeBytes, flg, nloop, nreg,
+                                     ps.lastEvent, ps.lastEventOff, ps.lastEventResumed, ps.lastImgNloop,
+                                     static_cast<unsigned long long>(tagLo));
+                }
+            }
+            ps.active = 1u;
         }
 
-        uint8_t regs[16];
-        for (uint32_t i = 0; i < nreg; ++i)
-            regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
-
-        if (flg == GIF_FMT_PACKED)
+        if (ps.flg == GIF_FMT_PACKED)
         {
-            for (uint32_t loop = 0; loop < nloop; ++loop)
+            while (ps.loopsLeft != 0u)
             {
-                for (uint32_t r = 0; r < nreg; ++r)
+                while (ps.regIndex < ps.nreg)
                 {
                     if (offset + 16 > sizeBytes)
-                        return;
-                    uint64_t lo = loadLE64(data + offset);
-                    uint64_t hi = loadLE64(data + offset + 8);
+                        goto suspend; // the level's big draw lists really do span DIRECTs
+                    const uint64_t lo = loadLE64(data + offset);
+                    const uint64_t hi = loadLE64(data + offset + 8);
                     offset += 16;
-                    writeRegisterPacked(regs[r], lo, hi);
+                    writeRegisterPacked(ps.regs[ps.regIndex], lo, hi);
+                    ++ps.regIndex;
                 }
+                ps.regIndex = 0u;
+                --ps.loopsLeft;
             }
+            ps.lastEvent = 2u;
+            ps.lastEventOff = offset;
+            ps.active = 0u;
         }
-        else if (flg == GIF_FMT_REGLIST)
+        else if (ps.flg == GIF_FMT_REGLIST)
         {
-            for (uint32_t loop = 0; loop < nloop; ++loop)
+            while (ps.regsLeft != 0u)
             {
-                for (uint32_t r = 0; r < nreg; ++r)
-                {
-                    if (offset + 8 > sizeBytes)
-                        return;
-                    writeRegisterUnlocked(regs[r], loadLE64(data + offset));
-                    offset += 8;
-                }
-            }
-            if ((nloop * nreg) & 1)
+                if (offset + 8 > sizeBytes)
+                    goto suspend;
+                writeRegisterUnlocked(ps.regs[ps.regIndex], loadLE64(data + offset));
                 offset += 8;
+                --ps.regsLeft;
+                if (++ps.regIndex == ps.nreg)
+                    ps.regIndex = 0u;
+            }
+            if (ps.padPending)
+            {
+                if (offset + 8 > sizeBytes)
+                    goto suspend;
+                offset += 8; // odd reg total: qword-align past the unused half
+                ps.padPending = false;
+            }
+            ps.active = 0u;
         }
-        else if (flg == GIF_FMT_IMAGE)
+        else // IMAGE / IMAGE2
         {
-            uint32_t imageBytes = nloop * 16;
-            if (offset + imageBytes > sizeBytes)
-                imageBytes = sizeBytes - offset;
-            processImageData(data + offset, imageBytes);
-            offset += imageBytes;
+            const uint32_t availQw = (sizeBytes - offset) / 16u;
+            const uint32_t chunkQw = std::min(ps.imageQwLeft, availQw);
+            if (chunkQw != 0u)
+            {
+                processImageData(data + offset, chunkQw * 16u);
+                offset += chunkQw * 16u;
+                ps.imageQwLeft -= chunkQw;
+            }
+            if (ps.imageQwLeft != 0u)
+                goto suspend;
+            ps.lastEvent = 1u;
+            ps.lastEventOff = offset;
+            ps.active = 0u;
         }
+    }
+    return;
+
+suspend:
+    ps.q = m_curQ; // mid-tag packet boundary: resume on this path's next packet
+    {
+        static unsigned long s_suspN = 0;
+        ++s_suspN;
+        if (s_suspN <= 48u || (s_suspN % 2048u) == 0u)
+            std::fprintf(stderr,
+                         "[gif:susp] #%lu path=%u flg=%u loopsLeft=%u regsLeft=%u imgQwLeft=%u "
+                         "regIdx=%u nreg=%u pkt=%u off=%u\n",
+                         s_suspN, g_gifActivePath, ps.flg, ps.loopsLeft, ps.regsLeft,
+                         ps.imageQwLeft, ps.regIndex, ps.nreg, sizeBytes, offset);
     }
 }
 
@@ -740,6 +1025,10 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
+        return false;
+    // PATH3 has a suspended tag mid-payload: this bypass would parse out of stream order and
+    // leave the pending state to poison the next PATH3 packet. Fall back to the normal route.
+    if (s_gifResume && g_gifParseState[3].active)
         return false;
 
     if (!validatePackedGifPacket(data, sizeBytes))
@@ -926,7 +1215,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
                                                     << std::endl);
             }
         });
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        GSVertex &vtx = m_vtxQueue[GS_VSLOT(m_vtxCount)];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
         vtx.z = static_cast<float>(z);
@@ -963,7 +1252,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
                                                    << std::endl);
             }
         });
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        GSVertex &vtx = m_vtxQueue[GS_VSLOT(m_vtxCount)];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
         vtx.z = static_cast<float>(z);
@@ -997,7 +1286,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
                                                      << std::endl);
             }
         });
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        GSVertex &vtx = m_vtxQueue[GS_VSLOT(m_vtxCount)];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
@@ -1028,7 +1317,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
                                                     << std::endl);
             }
         });
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        GSVertex &vtx = m_vtxQueue[GS_VSLOT(m_vtxCount)];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
@@ -1067,6 +1356,44 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (s_gifCensus)
+    {
+        g_gcRegW.fetch_add(1, std::memory_order_relaxed);
+        g_gcRegWPer[regAddr].fetch_add(1, std::memory_order_relaxed);
+        if (g_gcLastValSet[regAddr] && g_gcLastVal[regAddr] == value)
+        {
+            g_gcRegRedundant.fetch_add(1, std::memory_order_relaxed);
+            g_gcRegRedPer[regAddr].fetch_add(1, std::memory_order_relaxed);
+        }
+        g_gcLastVal[regAddr] = value;
+        g_gcLastValSet[regAddr] = true;
+    }
+    // PS2X_GS_FRAMETRAP: log implausible FRAME writes with the submitting path + parse phase,
+    // to locate the residual desync source (cont.156). Level-legit fbp: 0/128/256/384, fbw=8.
+    {
+        static const bool s_frameTrap = []
+        { const char *e = std::getenv("PS2X_GS_FRAMETRAP"); return e && e[0] && e[0] != '0'; }();
+        if (s_frameTrap && (regAddr == 0x4Cu || regAddr == 0x4Du))
+        {
+            const uint32_t fbp = static_cast<uint32_t>(value & 0x1FFu);
+            const uint32_t fbw = static_cast<uint32_t>((value >> 16) & 0x3Fu);
+            if (fbw != 8u || (fbp & 127u) != 0u)
+            {
+                static unsigned long s_n = 0;
+                ++s_n;
+                if (s_n <= 40u || (s_n % 1024u) == 0u)
+                {
+                    const GifParseState &tps = g_gifParseState[g_gifActivePath & 3u];
+                    std::fprintf(stderr,
+                                 "[gs:frametrap] #%lu reg=%02x val=%016llx fbp=%u fbw=%u path=%u "
+                                 "psActive=%u psFlg=%u loopsLeft=%u imgLeft=%u\n",
+                                 s_n, regAddr, static_cast<unsigned long long>(value), fbp, fbw,
+                                 g_gifActivePath, tps.active, tps.flg, tps.loopsLeft, tps.imageQwLeft);
+                }
+            }
+        }
+    }
+
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -1185,7 +1512,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_XYZF2:
     case GS_REG_XYZF3:
     {
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        GSVertex &vtx = m_vtxQueue[GS_VSLOT(m_vtxCount)];
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFF);
@@ -1205,7 +1532,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_XYZ2:
     case GS_REG_XYZ3:
     {
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+        GSVertex &vtx = m_vtxQueue[GS_VSLOT(m_vtxCount)];
         vtx.x = static_cast<float>(value & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((value >> 16) & 0xFFFF) / 16.0f;
         vtx.z = static_cast<double>((value >> 32) & 0xFFFFFFFF);
@@ -1497,7 +1824,16 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case 0x59:
         if (m_privRegs)
+        {
+            const bool flipped = m_privRegs->dispfb1 != value;
+            const uint64_t preFb1 = m_privRegs->dispfb1, preFb2 = m_privRegs->dispfb2;
             m_privRegs->dispfb1 = value;
+            g_ps2xGsLiveDispfb1.store(value, std::memory_order_release); // cont.345
+            // Display flip = a frame just completed in the PRE-write front buffer: snapshot
+            // it for presentation (cont.165 menu-text fix; see gs_cpu_backend.cpp).
+            if (flipped)
+                ps2xGsNotifyDisplayFlip(preFb1, preFb2);
+        }
         break;
     case 0x5a:
         if (m_privRegs)
@@ -1505,7 +1841,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case 0x5b:
         if (m_privRegs)
+        {
+            const bool flipped = m_privRegs->dispfb2 != value;
+            const uint64_t preFb1 = m_privRegs->dispfb1, preFb2 = m_privRegs->dispfb2;
             m_privRegs->dispfb2 = value;
+            g_ps2xGsLiveDispfb2.store(value, std::memory_order_release); // cont.345
+            if (flipped)
+                ps2xGsNotifyDisplayFlip(preFb1, preFb2);
+        }
         break;
     case 0x5c:
         if (m_privRegs)
@@ -1572,6 +1915,7 @@ void GS::vertexKick(bool drawing)
 
     if (drawing && m_backend)
     {
+        ++ps2xGsPathPrims[g_gifActivePath & 3u];
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
@@ -1587,16 +1931,24 @@ void GS::vertexKick(bool drawing)
         m_vtxCount = 0;
         break;
     case GS_PRIM_LINESTRIP:
-        m_vtxQueue[0] = m_vtxQueue[1];
+        if (s_vtxRing)
+            s_vtxBase = GS_VSLOT(1);
+        else
+            m_vtxQueue[0] = m_vtxQueue[1];
         m_vtxCount = 1;
         break;
     case GS_PRIM_TRISTRIP:
-        m_vtxQueue[0] = m_vtxQueue[1];
-        m_vtxQueue[1] = m_vtxQueue[2];
+        if (s_vtxRing)
+            s_vtxBase = GS_VSLOT(1);
+        else
+        {
+            m_vtxQueue[0] = m_vtxQueue[1];
+            m_vtxQueue[1] = m_vtxQueue[2];
+        }
         m_vtxCount = 2;
         break;
     case GS_PRIM_TRIFAN:
-        m_vtxQueue[1] = m_vtxQueue[2];
+        m_vtxQueue[GS_VSLOT(1)] = m_vtxQueue[GS_VSLOT(2)];
         m_vtxCount = 2;
         break;
     default:
@@ -1627,6 +1979,7 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    ps2gs::fence(4); // cont.317 stage 2: the GS->EE readback needs everything before it parsed
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }
 
@@ -1640,7 +1993,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
     if (m_backend)
     {
         m_backend->Flush();
-        m_backend->Sync(GSSyncReason::Reset);
+        ps2gs::fence(2); /* cont.317 stage 2 */ m_backend->Sync(GSSyncReason::Reset);
 
         // The external 4 MiB GS allocation is the backend hand-off format.
         // This keeps hot backend replacement deterministic even when a future
@@ -1672,12 +2025,57 @@ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_
         m_backend->WriteVram(psm, base, bw, x, y, value);
 }
 
+// ★★ rotk row 259 PS2X_GS_BATCHFAST (default ON; `=0` = value-initialise the batch, as before): `GSPrimitiveBatch
+// batch{}` zero-fills the whole 312-byte struct with `rep stosq` before every field is assigned anyway -- perf annotate
+// (GsPipeline, 60-fps fight) put 42% of buildDrawBatch's samples on that one instruction. The batch is now
+// aggregate-initialised with every member given (the same values the old fill assigned); the vertices past
+// vertexCount get GSVertex{} as before, so every field holds the same value. Only padding bytes differ, and no reader
+// looks at them (no raw hash / memcmp of a batch; the GL state dedup memcmps GsGpuState, built field by field).
+// Also: the ring slot as base + i minus one wrap (base < 6, i < 3) instead of a modulo per vertex.
+// (Default-initialising was not enough: the NSDMIs `vertices{}` / `state{}` value-initialise, GCC still emitted the
+// rep stosq; hence the full aggregate initialiser.)
+static const bool s_batchFast = []
+{ const char *e = std::getenv("PS2X_GS_BATCHFAST"); return !(e && e[0] == '0'); }();
+
 GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
 {
+    if (s_batchFast)
+    {
+        // Every member given, so nothing is zero-filled first, and the prvalue is built in the return slot.
+        const int n = std::min(vertexCount, 3);
+        const int s0 = s_vtxBase;
+        const int s1 = (s0 + 1 == kMaxVerts) ? 0 : s0 + 1;
+        const int s2 = (s1 + 1 == kMaxVerts) ? 0 : s1 + 1;
+        const GSContext &ctx = m_ctx[m_prim.ctxt ? 1 : 0];
+        const uint64_t tex1 = ctx.tex1;
+        const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
+        const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
+        return GSPrimitiveBatch{
+            {{n > 0 ? m_vtxQueue[s0] : GSVertex{},
+              n > 1 ? m_vtxQueue[s1] : GSVertex{},
+              n > 2 ? m_vtxQueue[s2] : GSVertex{}}},
+            static_cast<uint8_t>(n),
+            GSDrawState{
+                ctx,
+                m_prim,
+                m_texa,
+                m_texclut,
+                m_pabe,
+                m_scanmsk,
+                m_dimx,
+                m_dthe,
+                m_colclamp,
+                m_fogR,
+                m_fogG,
+                m_fogB,
+                static_cast<uint16_t>(1u << std::min<uint32_t>(ctx.tex0.tw, 10u)),
+                static_cast<uint16_t>(1u << std::min<uint32_t>(ctx.tex0.th, 10u)),
+                mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u}};
+    }
     GSPrimitiveBatch batch{};
     batch.vertexCount = static_cast<uint8_t>(std::min(vertexCount, 3));
     for (int i = 0; i < batch.vertexCount; ++i)
-        batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[i];
+        batch.vertices[static_cast<size_t>(i)] = m_vtxQueue[GS_VSLOT(i)];
     batch.state.context = m_ctx[m_prim.ctxt ? 1 : 0];
     batch.state.prim = m_prim;
     batch.state.texa = m_texa;
@@ -1704,7 +2102,10 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
     const GSDrawState &state = batch.state;
     const GSContext &ctx = state.context;
     if (m_hasPreferredDisplaySource && ctx.frame.fbp == m_preferredDisplayDestFbp)
+    {
         m_hasPreferredDisplaySource = false;
+        g_ps2xGsPreferredDisplaySource.store(0ull, std::memory_order_release); // cont.345
+    }
     if (state.prim.type != GS_PRIM_SPRITE || batch.vertexCount < 2u)
         return;
 
@@ -1729,5 +2130,10 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
         m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;
+        g_ps2xGsPreferredDisplaySource.store((1ull << 63) | (uint64_t(ctx.frame.fbp & 0xFFFFu)) |
+                                                 (uint64_t(ctx.tex0.tbp0 & 0xFFFFu) << 16) |
+                                                 (uint64_t(ctx.tex0.tbw & 0xFFu) << 32) |
+                                                 (uint64_t(ctx.tex0.psm & 0xFFu) << 40),
+                                             std::memory_order_release); // cont.345
     }
 }

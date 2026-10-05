@@ -309,13 +309,43 @@ public:
 
     // EE timers advance from the scheduler's emulated EE-cycle clock. The
     // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
-    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
-    [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
+    // cont.317: advanceEeTimers now BATCHES. The scheduler charges 8 cycles per guest call and 32 per
+    // loop back-edge through here, and the per-timer arithmetic ran on every one of them (3.3-4.2% of
+    // the EE thread's samples, live). Cycles accumulate in m_eeTimerPendingCycles and the timers are
+    // walked only when kEeTimerFlushCycles have accrued -- the rational tick accumulator is exact
+    // under batching (floor((a+b)*f + r) == the two-step result, remainder included), so counts and
+    // interrupt decisions are identical; only their LATENCY is bounded by the slack (512 EE cycles =
+    // 1.7 us, vs a 20 ms frame). Every guest-visible read/write of a timer register and the
+    // scheduler's deadline query flush first, so observed counts are exact. Interrupts raised by a
+    // flush that happens outside advanceEeTimers are latched and returned by its next call. PCSX2
+    // (Counters.cpp) is the same model: counters advance lazily at event boundaries and rcntRcount
+    // derives the exact count from cycle deltas on read.
+    // cont.317 (cont.): the accumulate-and-early-return half is INLINE -- it runs on every guest
+    // call and back-edge, and the out-of-line call was itself a measurable share once the walk
+    // was batched. The walk stays out of line.
+    inline uint32_t advanceEeTimers(uint64_t eeCycles) noexcept
+    {
+        m_eeTimerPendingCycles += eeCycles;
+        if (__builtin_expect(m_eeTimerPendingCycles < kEeTimerFlushCycles && m_eeTimerLatchedInterrupts == 0u, 1))
+            return 0u;
+        return advanceEeTimersFlushAndTake();
+    }
+    uint32_t advanceEeTimersFlushAndTake() noexcept;
+    [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() noexcept;
+    void flushEeTimers() noexcept;
+    static constexpr uint64_t kEeTimerFlushCycles = 512ull;
+    uint64_t m_eeTimerPendingCycles = 0ull;
+    uint32_t m_eeTimerLatchedInterrupts = 0u;
     void resetEeTimers() noexcept;
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
+    // Cycle 83: query the GS for qwords of image still expected on the in-flight transfer, so the
+    // VIF1 DIRECT handler can carry an image that overran a DIRECT into the next transfer using the
+    // RELIABLE transfer state (not a re-walk). Set by PS2Runtime where m_gs is in scope.
+    using GsPendingImageFn = std::function<uint32_t()>;
+    void setGsPendingImageFn(GsPendingImageFn fn) { m_gsPendingImageFn = std::move(fn); }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
@@ -382,6 +412,7 @@ public:
     // Registers
     GSRegisters gs_regs;
     uint8_t *m_gsVRAM;
+    size_t m_gsVRAMAlign = 0u;   // cont.357f: 0 = plain new[], else the aligned-new alignment
     VIFRegisters vif0_regs;
     VIFRegisters vif1_regs;
     DMARegisters dma_regs[10]; // 10 DMA channels
@@ -398,6 +429,7 @@ public:
     std::vector<TLBEntry> m_tlbEntries;
 
     GifPacketCallback m_gifPacketCallback;
+    GsPendingImageFn m_gsPendingImageFn;
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
@@ -450,6 +482,9 @@ public:
 
     std::array<EeTimer, 4> m_eeTimers{};
     void queueCompletedDmacCause(uint32_t cause);
+    // cont.245: mirror the PCSX2 IPU's DMA channels 3/4 back into the guest registers and raise their
+    // end-of-transfer interrupts (a decode kicked by a later IPU command finishes a DMA armed earlier).
+    void syncIpuDmaChannels();
 };
 
 #endif // PS2_MEMORY_H

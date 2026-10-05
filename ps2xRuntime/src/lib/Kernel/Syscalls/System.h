@@ -26,6 +26,8 @@ namespace ps2_syscalls
     void initializeGuestKernelState(uint8_t *rdram, PS2Runtime *runtime);
     void SetSyscall(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void LoadExecPS2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void ExecPS2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SetupHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void EndOfHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void GetMemorySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

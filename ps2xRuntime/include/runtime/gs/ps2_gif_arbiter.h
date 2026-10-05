@@ -29,6 +29,8 @@ public:
     explicit GifArbiter(ProcessPacketFn processFn);
 
     void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
+    using DrainDoneFn = std::function<void()>;
+    void setDrainDoneFn(DrainDoneFn fn) { m_drainDoneFn = std::move(fn); } // cont.230
 
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
@@ -37,6 +39,7 @@ public:
 
 private:
     ProcessPacketFn m_processFn;
+    DrainDoneFn m_drainDoneFn;
     std::vector<GifArbiterPacket> m_queue;
 
     static bool isImagePacket(const uint8_t *data, uint32_t sizeBytes);
