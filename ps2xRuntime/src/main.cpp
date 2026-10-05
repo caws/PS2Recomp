@@ -330,9 +330,6 @@ int main(int argc, char *argv[])
         // precede anything that reads a flag at runtime.
         bool ranLauncher = false;
 #if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
-        // User state lives in <exe dir>/config/ (user, 2026-10-01); bring back anything only the
-        // 2026-09-25..10-01 platform folder has (settings.ini, mc0, mc1) before anything reads it.
-        ps2x::userdir::migrateLegacy(argv);
         if (ps2x::launcher::shouldShow(argv))
         {
             if (ps2x::launcher::run(argv, windowTitle, pathObj) == ps2x::launcher::Result::Quit)
