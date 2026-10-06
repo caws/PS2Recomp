@@ -637,6 +637,8 @@ void EeScheduler::run()
                         }
                     }
                 }
+                copyMainContextToRuntime();
+                publishIdleDebugContext();
                 publishSnapshot();
                 waitForEvent();
                 continue;
@@ -698,10 +700,7 @@ void EeScheduler::run()
             --m_debugPublishCountdown;
         }
 
-        m_runtime.m_debugPc.store(context.pc, std::memory_order_relaxed);
-        m_runtime.m_debugRa.store(getRegU32(&context, 31), std::memory_order_relaxed);
-        m_runtime.m_debugSp.store(getRegU32(&context, 29), std::memory_order_relaxed);
-        m_runtime.m_debugGp.store(getRegU32(&context, 28), std::memory_order_relaxed);
+        publishDebugContext(context);
 
         if (context.pc == 0u)
         {
@@ -730,10 +729,13 @@ void EeScheduler::run()
             }
             makeDormant(*running);
             m_currentThreadId = 0;
+            copyMainContextToRuntime();
+            publishIdleDebugContext();
+            publishSnapshot();
             continue;
         }
 
-        if (!m_pendingInvocations.empty())
+        if (!m_pendingInvocations.empty() && running->invocations.empty())
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
@@ -2157,7 +2159,11 @@ void EeScheduler::publishSnapshot()
         }
         EeThreadSnapshot snapshot{};
         snapshot.id = id;
-        snapshot.pc = item.activeContext().pc;
+        const R5900Context &context = item.activeContext();
+        snapshot.pc = context.pc;
+        snapshot.ra = getRegU32(&context, 31);
+        snapshot.sp = getRegU32(&context, 29);
+        snapshot.contextGp = getRegU32(&context, 28);
         snapshot.entry = item.entry;
         snapshot.stack = item.stack;
         snapshot.stackSize = item.stackSize;
@@ -2169,6 +2175,7 @@ void EeScheduler::publishSnapshot()
         snapshot.waitId = waitObjectId(item.wait);
         snapshot.suspendCount = item.suspendCount;
         snapshot.wakeupCount = item.wakeupCount;
+        snapshot.invocationDepth = static_cast<uint32_t>(item.invocations.size());
         next.threads.push_back(snapshot);
     }
     std::sort(next.threads.begin(), next.threads.end(), [](const auto &left, const auto &right)
@@ -2932,5 +2939,37 @@ void EeScheduler::copyMainContextToRuntime()
     if (main)
     {
         m_runtime.m_cpuContext = main->context;
+    }
+}
+
+void EeScheduler::publishDebugContext(const R5900Context &context)
+{
+    m_runtime.m_debugPc.store(context.pc, std::memory_order_relaxed);
+    m_runtime.m_debugRa.store(getRegU32(&context, 31), std::memory_order_relaxed);
+    m_runtime.m_debugSp.store(getRegU32(&context, 29), std::memory_order_relaxed);
+    m_runtime.m_debugGp.store(getRegU32(&context, 28), std::memory_order_relaxed);
+}
+
+void EeScheduler::publishIdleDebugContext()
+{
+    // Temporary IRQ/RPC/alarm invocations deliberately return to PC=0. Once
+    // the scheduler is idle, show a real EE thread context instead of leaving
+    // the debugger pinned to that completed dispatcher frame.
+    const GuestThread *selected = thread(kMainThreadId);
+    if (!selected)
+    {
+        for (const auto &[id, candidate] : m_threads)
+        {
+            if (id > 0 && candidate.status != EeThreadStatus::Dormant)
+            {
+                selected = &candidate;
+                break;
+            }
+        }
+    }
+
+    if (selected)
+    {
+        publishDebugContext(selected->activeContext());
     }
 }

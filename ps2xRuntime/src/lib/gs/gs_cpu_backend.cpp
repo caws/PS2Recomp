@@ -5261,6 +5261,10 @@ void GSCpuBackend::flushPendingDraws() const
     const_cast<GSCpuBackend *>(this)->enqueueWork(std::move(item)); // the queue is mutable state behind const read-side entries
 }
 
+void GSCpuBackend::LoadClut(const GSTex0Reg &, const GSTexClutReg &)
+{
+}
+
 void GSCpuBackend::EndPacket()
 {
     if (s_gsThread && s_gsDrawRun && s_gsRunFlushPacket)

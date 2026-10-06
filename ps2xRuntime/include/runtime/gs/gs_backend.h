@@ -17,6 +17,7 @@ public:
     // cont.230: end of a GIF packet (or of an arbiter drain) -- a backend that buffers draws may
     // release them here. Default: nothing.
     virtual void EndPacket() {}
+    virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
 
     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
     virtual void UploadImage(const uint8_t *data, uint32_t sizeBytes) = 0;

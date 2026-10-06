@@ -34,6 +34,10 @@ public:
 
     void Submit(const GSPrimitiveBatch &batch) override;
     void EndPacket() override;
+    // Upstream 75d729c: TEX0/TEX2 writes with CLD != 0 announce a CLUT load. This backend keeps its own model --
+    // the palette is decoded from VRAM per primitive in resolveDraw (cont.227/227b, ResolvedDraw::clut) -- so the
+    // announcement is not needed. No-op.
+    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
     void BeginTransfer(const GSTransferCommand &command) override;
     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
 
