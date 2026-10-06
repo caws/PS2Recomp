@@ -324,6 +324,11 @@ public:
     [[nodiscard]] bool iopSifCommandForwarding() const noexcept { return m_iopSifCommandForwarding; }
     bool sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
                            uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
+    // rotk row 269: run the EE SIF command handlers the IOP has queued (GuestInvocationKind::SifCommand) NOW, to
+    // completion, on a copy of `ctx` below its stack pointer -- the SIF interrupt preempting the running code, as on
+    // hardware. For a hook whose guest chain waits on an IOP reply inside a host-pump scope, where the scheduler
+    // cannot deliver an invocation until the chain ends. Returns how many handlers ran.
+    uint32_t runPendingSifCommandHandlers(uint8_t *rdram, const R5900Context &ctx);
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,

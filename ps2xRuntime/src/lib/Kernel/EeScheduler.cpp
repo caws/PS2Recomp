@@ -1742,6 +1742,21 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     m_checkpointPending.store(true, std::memory_order_release);
 }
 
+bool EeScheduler::takePendingInvocation(GuestInvocationKind kind, GuestInvocation &out)
+{
+    assertExecutor();
+    for (auto it = m_pendingInvocations.begin(); it != m_pendingInvocations.end(); ++it)
+    {
+        if (it->kind == kind)
+        {
+            out = std::move(*it);
+            m_pendingInvocations.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
 [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
 {
     assertExecutor();
