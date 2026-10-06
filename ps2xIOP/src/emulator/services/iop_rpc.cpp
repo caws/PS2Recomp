@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -23,6 +24,178 @@ namespace ps2x::iop::detail
         m_servers.clear();
         m_nextDmaId = 1u;
         m_sifInitialized = false;
+        m_sregs.fill(0u);
+        m_usrHandlerTable = 0u;
+        m_usrHandlerCount = 0u;
+        m_sysHandlerTable = 0u;
+        m_sysHandlerCount = 0u;
+        m_sysHandlers.fill({});
+        m_handlerGp.clear();
+        m_receiveBuffer = 0u;
+        m_servicingEeCommands = false;
+        std::lock_guard<std::mutex> lock(m_eeCommandMutex);
+        m_eeCommands.clear();
+    }
+
+    namespace
+    {
+        constexpr uint32_t kSifCmdSystem = 0x80000000u;
+        constexpr uint32_t kSifCmdChangeSaddr = 0x80000000u;
+        constexpr uint32_t kSifCmdSetSreg = 0x80000001u;
+        constexpr uint32_t kSifCmdInitCmd = 0x80000002u;
+        constexpr uint32_t kSifCmdHeaderSize = 16u;
+        constexpr uint32_t kSifCmdMaxPacket = 112u;
+        constexpr uint32_t kSifCmdSysEntries = 32u;
+
+        // An IOP address that names IOP RAM (kuseg / kseg0 / kseg1 view of the 2 MB).
+        bool isIopRamRange(uint32_t address, uint32_t size)
+        {
+            const bool segment = address < IopMemory::RamSize ||
+                                 (address >= 0x80000000u && address < 0x80200000u) ||
+                                 (address >= 0xA0000000u && address < 0xA0200000u);
+            if (!segment)
+                return false;
+            const uint32_t physical = IopMemory::physicalAddress(address);
+            return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
+        }
+    }
+
+    bool IopRpcBridge::queueEeCommand(uint32_t cid, const void *packet, uint32_t packetSize,
+                                      uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize)
+    {
+        if (!packet || packetSize < kSifCmdHeaderSize || packetSize > kSifCmdMaxPacket)
+            return false;
+
+        // The extra data is the head of the SIF1 chain (EE sceSifSendCmd), so it is in IOP RAM before the packet is
+        // received. A destination outside IOP RAM is dropped, not wrapped: it would land on unrelated IOP memory.
+        if (extraSize != 0u && eeExtraSource != 0u)
+        {
+            if (!isIopRamRange(iopExtraDestination, extraSize))
+            {
+                static uint32_t s_badDest = 0u;
+                if (s_badDest++ < 4u)
+                {
+                    char line[160];
+                    std::snprintf(line, sizeof(line), "[IOP] SIF command 0x%08x: extra data to 0x%08x (+0x%x) is not IOP RAM; dropped",
+                                  cid, iopExtraDestination, extraSize);
+                    m_host.log(LogLevel::Warning, line);
+                }
+            }
+            else
+            {
+                std::vector<uint8_t> extra(extraSize);
+                if (m_host.readGuest(eeExtraSource, extra.data(), extra.size()))
+                    (void)m_memory.writeRam(iopExtraDestination, extra.data(), extra.size());
+            }
+        }
+
+        PendingEeCommand command;
+        std::memcpy(command.packet.data(), packet, packetSize);
+        command.size = packetSize;
+        // Header words as the EE's sifcmd writes them: psize | dsize << 8, dest, cid (opt is the caller's).
+        const uint32_t sizeWord = (packetSize & 0xFFu) | (extraSize << 8u);
+        std::memcpy(command.packet.data() + 0u, &sizeWord, sizeof(sizeWord));
+        std::memcpy(command.packet.data() + 4u, &iopExtraDestination, sizeof(iopExtraDestination));
+        std::memcpy(command.packet.data() + 8u, &cid, sizeof(cid));
+        std::lock_guard<std::mutex> lock(m_eeCommandMutex);
+        m_eeCommands.push_back(command);
+        return true;
+    }
+
+    bool IopRpcBridge::hasPendingEeCommands() const
+    {
+        std::lock_guard<std::mutex> lock(m_eeCommandMutex);
+        return !m_eeCommands.empty();
+    }
+
+    // The handlers sifcmd installs for itself at InitCmd (ps2sdk sifcmd.c _change_addr / _set_sreg /
+    // sif_sys_cmd_handler_init_from_ee), used when the system slot holds no guest handler.
+    bool IopRpcBridge::dispatchBuiltinSystemCommand(uint32_t cid, const uint8_t *packet, uint32_t size)
+    {
+        if (cid == kSifCmdSetSreg && size >= kSifCmdHeaderSize + 8u)
+        {
+            int32_t index = 0;
+            uint32_t value = 0u;
+            std::memcpy(&index, packet + 16u, sizeof(index));
+            std::memcpy(&value, packet + 20u, sizeof(value));
+            if (index >= 0 && static_cast<uint32_t>(index) < m_sregs.size())
+                m_sregs[static_cast<uint32_t>(index)] = value;
+            return true;
+        }
+        // CHANGE_SADDR / INIT_CMD only move sifcmd's EE send buffer, which the host transport does not use.
+        return cid == kSifCmdChangeSaddr || cid == kSifCmdInitCmd;
+    }
+
+    void IopRpcBridge::serviceEeCommands(IopGuestExecutor &executor)
+    {
+        if (m_servicingEeCommands)
+            return;
+        m_servicingEeCommands = true;
+        for (;;)
+        {
+            PendingEeCommand command;
+            {
+                std::lock_guard<std::mutex> lock(m_eeCommandMutex);
+                if (m_eeCommands.empty())
+                    break;
+                command = m_eeCommands.front();
+                m_eeCommands.pop_front();
+            }
+            uint32_t cid = 0u;
+            std::memcpy(&cid, command.packet.data() + 8u, sizeof(cid));
+            const bool system = (cid & kSifCmdSystem) != 0u;
+            const uint32_t index = cid & 0x7FFFFFFFu;
+
+            // _sceSifCmdIntrHdlr: index < the table's size, and a non-null handler, else the packet is dropped.
+            uint32_t handler = 0u;
+            uint32_t argument = 0u;
+            if (!system)
+            {
+                if (m_usrHandlerTable != 0u && index < m_usrHandlerCount)
+                {
+                    handler = m_memory.read32(m_usrHandlerTable + index * 8u);
+                    argument = m_memory.read32(m_usrHandlerTable + index * 8u + 4u);
+                }
+            }
+            else if (m_sysHandlerTable != 0u)
+            {
+                if (index < m_sysHandlerCount)
+                {
+                    handler = m_memory.read32(m_sysHandlerTable + index * 12u);
+                    argument = m_memory.read32(m_sysHandlerTable + index * 12u + 4u);
+                }
+            }
+            else if (index < kSifCmdSysEntries)
+            {
+                handler = m_sysHandlers[index].handler;
+                argument = m_sysHandlers[index].argument;
+            }
+
+            if (handler == 0u)
+            {
+                if (!(system && dispatchBuiltinSystemCommand(cid, command.packet.data(), command.size)))
+                {
+                    static uint32_t s_dropped = 0u;
+                    if (s_dropped++ < 8u)
+                    {
+                        char line[96];
+                        std::snprintf(line, sizeof(line), "[IOP] SIF command 0x%08x from the EE has no handler; dropped", cid);
+                        m_host.log(LogLevel::Warning, line);
+                    }
+                }
+                continue;
+            }
+
+            // The handler gets a copy of the packet (sifcmd copies it to a stack buffer before the call).
+            if (m_receiveBuffer == 0u)
+                m_receiveBuffer = m_memory.allocate(kSifCmdMaxPacket, 16u);
+            if (m_receiveBuffer == 0u || !m_memory.writeRam(m_receiveBuffer, command.packet.data(), command.size))
+                continue;
+            const auto gp = m_handlerGp.find(cid);
+            (void)executor.executeGuestFunctionWithBudget(handler, m_receiveBuffer, argument, 0u, 0u,
+                                                          gp != m_handlerGp.end() ? gp->second : 0u, 100000u);
+        }
+        m_servicingEeCommands = false;
     }
 
     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
@@ -139,14 +312,55 @@ namespace ps2x::iop::detail
         };
         switch (ordinal)
         {
+        // Ordinals and behaviour: ps2sdk iop/system/sifcmd (exports.tab, sifcmd.c).
+        case 6: // sceSifGetSreg
+            setV0(cpu.gpr[4] < m_sregs.size() ? m_sregs[cpu.gpr[4]] : 0u);
+            return true;
+        case 7: // sceSifSetSreg
+            if (cpu.gpr[4] < m_sregs.size())
+                m_sregs[cpu.gpr[4]] = cpu.gpr[5];
+            setV0(0u);
+            return true;
+        case 8: // sceSifSetCmdBuffer(db, size)
+            m_usrHandlerTable = cpu.gpr[4];
+            m_usrHandlerCount = cpu.gpr[5];
+            setV0(0u);
+            return true;
+        case 9: // sceSifSetSysCmdBuffer(db, size)
+            m_sysHandlerTable = cpu.gpr[4];
+            m_sysHandlerCount = cpu.gpr[5];
+            setV0(0u);
+            return true;
+        case 10: // sceSifAddCmdHandler(cid, handler, harg)
+        case 11: // sceSifRemoveCmdHandler(cid) = AddCmdHandler(cid, NULL, NULL)
+        {
+            const uint32_t cid = cpu.gpr[4];
+            const uint32_t handler = ordinal == 10 ? cpu.gpr[5] : 0u;
+            const uint32_t argument = ordinal == 10 ? cpu.gpr[6] : 0u;
+            const uint32_t index = cid & 0x7FFFFFFFu;
+            if ((cid & 0x80000000u) == 0u)
+            {
+                if (m_usrHandlerTable != 0u)
+                {
+                    m_memory.write32(m_usrHandlerTable + index * 8u, handler);
+                    m_memory.write32(m_usrHandlerTable + index * 8u + 4u, argument);
+                }
+            }
+            else if (m_sysHandlerTable != 0u)
+            {
+                m_memory.write32(m_sysHandlerTable + index * 12u, handler);
+                m_memory.write32(m_sysHandlerTable + index * 12u + 4u, argument);
+            }
+            else if (index < m_sysHandlers.size())
+            {
+                m_sysHandlers[index] = {handler, argument};
+            }
+            m_handlerGp[cid] = cpu.gpr[28];
+            setV0(0u);
+            return true;
+        }
         case 4: // InitCmd
         case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-        case 10:
-        case 11:
         case 14: // InitRpc
         case 15:
         case 16:

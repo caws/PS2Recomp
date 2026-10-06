@@ -33,6 +33,13 @@ namespace ps2x::iop
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         void onSifTransfer(const SifTransfer &transfer);
 
+        // EE -> IOP SIF command (the EE's sceSifSendCmd): the extra data is copied into IOP RAM at once, the packet is
+        // delivered to the IOP handler registered for cid on the IOP's next run. False = malformed packet.
+        bool sendSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
+                            uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
+        // The IOP's sifcmd software register `index` (0..31), as sceSifGetSreg on the IOP would read it.
+        [[nodiscard]] uint32_t iopSoftwareRegister(uint32_t index) const noexcept;
+
         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);
         [[nodiscard]] bool freeMemory(uint32_t address);

@@ -27,6 +27,9 @@ namespace ps2x::iop::detail
         void runEeCycles(uint64_t eeCycles) noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+        bool queueSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
+                             uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
+        [[nodiscard]] uint32_t softwareRegister(uint32_t index) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
 
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);

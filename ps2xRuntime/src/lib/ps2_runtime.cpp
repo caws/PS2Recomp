@@ -751,6 +751,15 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
+bool PS2Runtime::sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
+                                   uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize)
+{
+    if (!m_iopSubsystem || !m_iopSifCommandForwarding)
+        return false;
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->sendSifCommand(cid, packet, packetSize, eeExtraSource, iopExtraDestination, extraSize);
+}
+
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
     m_iopSubsystem->runEeCycles(eeCycles);

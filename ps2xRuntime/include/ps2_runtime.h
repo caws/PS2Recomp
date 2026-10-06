@@ -317,6 +317,13 @@ public:
     bool writeIopMemory(uint32_t address, const void *source, size_t size);
     bool zeroIopMemory(uint32_t address, size_t size);
     bool isIopMemoryRange(uint32_t address, size_t size) const;
+    // EE sceSifSendCmd -> the emulated IOP (ps2x::iop::IopSubsystem::sendSifCommand). OFF by default: a game whose
+    // IOP services are HLE'd keeps today's behaviour (commands go nowhere); a game that runs its own IRX on the
+    // emulated IOP turns it on (rotk: LOTR_IOP_LLE=1). sendIopSifCommand does nothing while it is off.
+    void setIopSifCommandForwarding(bool enabled) noexcept { m_iopSifCommandForwarding = enabled; }
+    [[nodiscard]] bool iopSifCommandForwarding() const noexcept { return m_iopSifCommandForwarding; }
+    bool sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
+                           uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -510,6 +517,7 @@ private:
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
+    std::atomic<bool> m_iopSifCommandForwarding{false};
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

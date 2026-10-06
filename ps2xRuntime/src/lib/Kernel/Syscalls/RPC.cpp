@@ -985,6 +985,11 @@ namespace ps2_syscalls
         // over 0x0..0xFFFFE. dest_extra is an IOP address; this runtime has no IOP RAM and the
         // IOP-side HLE reads the EE buffers directly, so the extra-data DMA has no target here and
         // is not copied anywhere. (PCSX2 runs the real IOP kernel, so it has no equivalent stub.)
+        // rotk row 268: the command now also goes to the emulated IOP (upstream 75d729c): the extra data is copied
+        // into IOP RAM and the packet handed to the handler an IOP module registered with sceSifAddCmdHandler, as
+        // the IOP's sifcmd does on the SIF1 receive interrupt (ps2sdk iop/system/sifcmd/src/sifcmd.c). Commands
+        // with no IOP handler are dropped there, as on hardware. Only when the game enables it
+        // (PS2Runtime::setIopSifCommandForwarding); otherwise nothing changes.
         const uint32_t cid = getRegU32(ctx, 4);
         const uint32_t packetAddr = getRegU32(ctx, 5);
         const uint32_t packetSize = getRegU32(ctx, 6);
@@ -1002,6 +1007,24 @@ namespace ps2_syscalls
                                                  << " dest(iop)=0x" << destExtra
                                                  << " size=0x" << sizeExtra << std::dec << std::endl);
             ++logCount;
+        }
+
+        if (runtime && runtime->iopSifCommandForwarding() && packetSize >= 16u && packetSize <= 112u)
+        {
+            uint8_t packet[112];
+            bool readable = true;
+            for (uint32_t i = 0; i < packetSize; ++i)
+            {
+                const uint8_t *src = getConstMemPtr(rdram, packetAddr + i);
+                if (!src)
+                {
+                    readable = false;
+                    break;
+                }
+                packet[i] = *src;
+            }
+            if (readable)
+                (void)runtime->sendIopSifCommand(cid, packet, packetSize, srcExtra, destExtra, sizeExtra);
         }
 
         // Return non-zero on success.

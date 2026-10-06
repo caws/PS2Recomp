@@ -235,6 +235,23 @@ namespace ps2_stubs
         if (!rdram || !runtime || !packet || packetSize < 16u || packetSize > 112u)
             return false;
 
+        // rotk row 268: SIF_CMD_SET_SREG (0x80000001) is a system command the EE kernel's sifcmd handles itself
+        // (ps2sdk ee/kernel/src/sifcmd.c set_sreg, installed by sceSifInitCmd: sregs[pkt->sreg] = pkt->val), so an IOP module announcing a
+        // buffer (AUDIOPF's DmaThreadSync) reaches sceSifGetSreg without any registered handler.
+        if (commandId == 0x80000001u && packetSize >= 24u)
+        {
+            int32_t index = 0;
+            uint32_t value = 0u;
+            std::memcpy(&index, static_cast<const uint8_t *>(packet) + 16u, sizeof(index));
+            std::memcpy(&value, static_cast<const uint8_t *>(packet) + 20u, sizeof(value));
+            if (index >= 0 && index < 32)
+            {
+                std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);
+                g_sifSregs[static_cast<uint32_t>(index)] = value;
+            }
+            return true;
+        }
+
         SifCmdHandler registered{};
         {
             std::lock_guard<std::mutex> lock(g_sifCmdStateMutex);

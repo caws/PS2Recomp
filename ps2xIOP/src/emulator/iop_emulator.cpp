@@ -427,6 +427,8 @@ namespace ps2x::iop::detail
                     servicePendingDmaInterrupts();
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
                     servicePendingGuestCallbacks();
+                if (rpc.hasPendingEeCommands())
+                    rpc.serviceEeCommands(*this);
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
@@ -579,6 +581,8 @@ namespace ps2x::iop::detail
                 {
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
+                    if (rpc.hasPendingEeCommands())
+                        rpc.serviceEeCommands(*this);
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
@@ -768,6 +772,17 @@ namespace ps2x::iop::detail
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
         return m_impl->rpc.handleRpc(request, *m_impl);
+    }
+
+    bool IopEmulator::queueSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
+                                      uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize)
+    {
+        return m_impl->rpc.queueEeCommand(cid, packet, packetSize, eeExtraSource, iopExtraDestination, extraSize);
+    }
+
+    uint32_t IopEmulator::softwareRegister(uint32_t index) const noexcept
+    {
+        return m_impl->rpc.softwareRegister(index);
     }
 
     bool IopEmulator::hasRpcServer(uint32_t sid) const noexcept

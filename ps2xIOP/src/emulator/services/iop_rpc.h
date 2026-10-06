@@ -2,8 +2,11 @@
 
 #include "ps2x/iop/iop_types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <mutex>
 #include <unordered_map>
 
 namespace ps2x::iop
@@ -52,6 +55,18 @@ namespace ps2x::iop::detail
         void onSifTransfer(const SifTransfer &transfer);
         void removeServersInRange(uint32_t base, uint32_t size);
 
+        // EE -> IOP SIF command (the EE's sceSifSendCmd). The extra data is copied into IOP RAM now (on hardware it
+        // rides the same SIF1 DMA chain, ahead of the packet); the packet is queued and handed to its handler by
+        // serviceEeCommands(), the IOP-side receive interrupt. Thread-safe: the EE thread queues, the IOP drains.
+        bool queueEeCommand(uint32_t cid, const void *packet, uint32_t packetSize,
+                            uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
+        [[nodiscard]] bool hasPendingEeCommands() const;
+        [[nodiscard]] uint32_t softwareRegister(uint32_t index) const noexcept
+        {
+            return index < m_sregs.size() ? m_sregs[index] : 0u;
+        }
+        void serviceEeCommands(IopGuestExecutor &executor);
+
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
 
@@ -68,11 +83,40 @@ namespace ps2x::iop::detail
             uint32_t queue = 0;
         };
 
+        struct PendingEeCommand
+        {
+            std::array<uint8_t, 112> packet{};
+            uint32_t size = 0u;
+        };
+
+        struct SysHandler
+        {
+            uint32_t handler = 0u;
+            uint32_t argument = 0u;
+        };
+
+        bool dispatchBuiltinSystemCommand(uint32_t cid, const uint8_t *packet, uint32_t size);
+
         IopHost &m_host;
         IopMemory &m_memory;
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
+
+        // sifcmd state (ps2sdk iop/system/sifcmd/src/sifcmd.c): 32 software registers, the user handler table the
+        // module hands over with sceSifSetCmdBuffer (guest RAM, 8-byte {handler, harg} entries), and the system
+        // table -- sifcmd's own unless sceSifSetSysCmdBuffer supplies one (12-byte entries).
+        std::array<uint32_t, 32> m_sregs{};
+        uint32_t m_usrHandlerTable = 0u;
+        uint32_t m_usrHandlerCount = 0u;
+        uint32_t m_sysHandlerTable = 0u;
+        uint32_t m_sysHandlerCount = 0u;
+        std::array<SysHandler, 32> m_sysHandlers{};
+        std::unordered_map<uint32_t, uint32_t> m_handlerGp;
+        uint32_t m_receiveBuffer = 0u;
+        bool m_servicingEeCommands = false;
+        mutable std::mutex m_eeCommandMutex;
+        std::deque<PendingEeCommand> m_eeCommands;
     };
 }
