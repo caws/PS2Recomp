@@ -295,7 +295,12 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
+        // The services the BIOS's own IOP modules register at every IOP boot (rom0 FILEIO 0x80000001, the IOP heap
+        // 0x80000003, LOADFILE 0x80000006; ps2sdk iopheap/fileio/loadfile clients bind them with no module load
+        // first). With no BIOS here nothing registers them, so a client's bind loop (rotk USA `_lf_bind` 0x1204C8)
+        // would retry forever. Upstream 75d729c dropped the old "dummy server for every sid"; this keeps only these.
+        const bool biosResident = rpcId == 0x80000001u || rpcId == 0x80000003u || rpcId == 0x80000006u;
+        if (!serverPtr && (biosResident || PS2IopTransport::canBindRpc(runtime, rpcId)))
         {
             // EE-side servers and HLE routes need a descriptor in guest RAM.
             // With an emulated IOP, only publish it after the IRX has actually
