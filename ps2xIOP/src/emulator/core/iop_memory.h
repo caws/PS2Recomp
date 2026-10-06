@@ -22,7 +22,11 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // One pool for module images AND AllocSysMemory, first-fit, as the IOP's sysmem/loadcore keep it (loadcore takes
+        // a module's image from sysmem too). Upstream 75d729c split it at 0x120000 (images below, a bump heap above): a
+        // large IRX (rotk AUDIOPF: 768 KB + 32 KB + thread stacks) then exhausted the 896 KB heap while ~800 KB above the
+        // loaded images stayed unused, and its CreateThread failed with KE_NO_MEMORY (rotk row 267).
+        static constexpr uint32_t HeapBase = 0x00010000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation

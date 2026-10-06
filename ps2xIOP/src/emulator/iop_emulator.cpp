@@ -18,6 +18,8 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cctype>
 #include <map>
 #include <optional>
@@ -237,7 +239,22 @@ namespace ps2x::iop::detail
             Missing,
         };
 
+        // PS2X_IOP_IMPORTLOG=1 (diagnostic, default OFF; rotk row 267): one line per IOP import call -- library:ordinal,
+        // a0-a3 on entry, v0 and the disposition on return. Answers "which call made this module fail" without a debugger.
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+        {
+            static const bool s_importLog = [] { const char *e = std::getenv("PS2X_IOP_IMPORTLOG"); return e && e[0] == '1'; }();
+            if (!s_importLog)
+                return dispatchImportImpl(call, cpu);
+            const uint32_t a0 = cpu.gpr[4], a1 = cpu.gpr[5], a2 = cpu.gpr[6], a3 = cpu.gpr[7], ra = cpu.gpr[31];
+            const ImportDisposition d = dispatchImportImpl(call, cpu);
+            std::fprintf(stderr, "[iop:import] %s:%u a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x -> v0=%08x %s\n",
+                         call.library.c_str(), static_cast<unsigned>(call.ordinal), a0, a1, a2, a3, ra, cpu.gpr[2],
+                         d == ImportDisposition::Handled ? "hle" : d == ImportDisposition::JumpToGuest ? "guest" : "MISSING");
+            return d;
+        }
+
+        ImportDisposition dispatchImportImpl(const IopImportCall &call, CpuState &cpu)
         {
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)

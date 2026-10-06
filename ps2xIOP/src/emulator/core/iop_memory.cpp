@@ -299,7 +299,7 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        uint32_t candidate = alignUp(HeapBase, alignment);   // first-fit (row 267), not a bump from m_heapCursor
         for (;;)
         {
             bool overlap = false;
@@ -339,7 +339,21 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        // The largest free gap of the pool (row 267: allocation is first-fit, so the top is not the only free space).
+        std::vector<Allocation> blocks(m_allocations.begin(), m_allocations.end());
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
+        uint32_t cursor = HeapBase, best = 0u;
+        for (const auto &block : blocks)
+        {
+            if (block.address + block.size <= cursor || block.address >= HeapLimit)
+                continue;
+            if (block.address > cursor)
+                best = std::max(best, block.address - cursor);
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        if (cursor < HeapLimit)
+            best = std::max(best, HeapLimit - cursor);
+        return best;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

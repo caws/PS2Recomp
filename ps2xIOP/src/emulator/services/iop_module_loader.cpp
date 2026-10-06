@@ -431,8 +431,10 @@ namespace ps2x::iop::detail
         int64_t delta = 0;
         if (relocate)
         {
-            base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            // The image comes from the shared sysmem pool (row 267), as loadcore takes it on the IOP.
+            (void)moduleCursor;
+            base = memory.allocate(span, 0x100u);
+            if (base == 0u)
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
@@ -443,6 +445,7 @@ namespace ps2x::iop::detail
         else
         {
             base = minVaddr;
+            (void)memory.allocate(span, 0x100u, base);   // reserve a fixed-address image in the pool (row 267)
         }
 
         if (hasLoad)
