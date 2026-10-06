@@ -1519,12 +1519,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
-            // Upstream 75d729c's NORMAL-mode scratchpad DMA (ch8/ch9). Ours (rows 12/40, below: normal + chain +
-            // interleave) stays authoritative until the two are compared on the oracles. PS2X_DMA_SPR_UPSTREAM=1 (default
-            // OFF) lets upstream's path take normal-mode transfers, for that A/B.
+            // Upstream 75d729c's NORMAL-mode scratchpad DMA (ch8/ch9) owns normal mode; ours (rows 12/40, below) keeps
+            // chain + interleave. A/B 2026-10-06 (row 265): with it on, the rotk fight replay was bit-identical over 6,272
+            // flips while ~4,000 normal-mode kicks (PS2X_SPR_LOG) went through it. PS2X_DMA_SPR_UPSTREAM=0 = ours for
+            // normal mode too (the pre-merge behaviour), until our normal-mode branch is deleted.
             static const bool s_sprUpstream = [] {
                 const char *e = std::getenv("PS2X_DMA_SPR_UPSTREAM");
-                return e && e[0] && e[0] != '0';
+                return !(e && e[0] == '0');
             }();
             if (s_sprUpstream && tryProcessScratchpadDma(channelBase, value))
             {
