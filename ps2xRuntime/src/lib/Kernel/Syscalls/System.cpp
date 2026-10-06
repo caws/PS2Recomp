@@ -257,6 +257,9 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    // Kept on merging upstream 75d729c (which removed it in favour of PS2RomDevice's rom0:ROMVER): rotk stubs
+    // GetRomName@0x263618 (EUR) / 0x2715C0 (USA) and its IsT10K reads this reply. Dropping the stub so the guest
+    // reads rom0:ROMVER itself is a separate experiment (upstream answers "0200AC...", a USA console).
     void GetRomName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t bufAddr = getRegU32(ctx, 4); // $a0
@@ -320,33 +323,40 @@ namespace ps2_syscalls
 
     void sceSifLoadModuleBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t bufferAddr = getRegU32(ctx, 4); // $a0
+        const uint32_t bufferAddr = getRegU32(ctx, 4);   // $a0
+        const uint32_t argumentSize = getRegU32(ctx, 5); // $a1
+        const uint32_t argumentAddr = getRegU32(ctx, 6); // $a2
         if (!rdram || bufferAddr == 0u)
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        // Match buffer-based module loads to stable synthetic tags so module ID lookup remains deterministic.
         const std::string moduleTag = makeSifModuleBufferTag(rdram, bufferAddr);
-        const int32_t moduleId = trackSifModuleLoad(moduleTag);
-        if (moduleId <= 0)
+        std::vector<uint8_t> arguments;
+        constexpr uint32_t kMaxIopModuleArguments = 64u * 1024u;
+        if (!copyGuestBytesBounded(rdram, argumentAddr, argumentSize, kMaxIopModuleArguments, arguments))
         {
             setReturnS32(ctx, -1);
             return;
         }
 
-        uint32_t refs = 0;
+        if (!runtime)
         {
-            std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-            auto it = g_sif_modules_by_id.find(moduleId);
-            if (it != g_sif_modules_by_id.end())
-            {
-                refs = it->second.refCount;
-            }
+            setReturnS32(ctx, -1);
+            return;
         }
-        logSifModuleAction("load-buffer", moduleId, moduleTag, refs);
-        setReturnS32(ctx, moduleId);
+
+        const auto loaded = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
+        if (!loaded.handled || loaded.moduleId <= 0)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        trackSifModuleLoadExternal(moduleTag, loaded.moduleId);
+        logSifModuleAction("load-buffer-emulated", loaded.moduleId, moduleTag, 1u);
+        setReturnS32(ctx, loaded.moduleId);
     }
 
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, uint32_t encodedSyscallId)

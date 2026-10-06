@@ -90,6 +90,7 @@ enum class GuestInvocationKind : uint8_t
     SyscallOverride,
     ExitHandler,
     HleCall,
+    SifCommand,
 };
 
 struct GuestInvocation
@@ -181,6 +182,9 @@ struct EeThreadSnapshot
 {
     int id = 0;
     uint32_t pc = 0;
+    uint32_t ra = 0;
+    uint32_t sp = 0;
+    uint32_t contextGp = 0;
     uint32_t entry = 0;
     uint32_t stack = 0;
     uint32_t stackSize = 0;
@@ -192,6 +196,7 @@ struct EeThreadSnapshot
     int waitId = 0;
     int suspendCount = 0;
     uint32_t wakeupCount = 0;
+    uint32_t invocationDepth = 0;
 };
 
 struct EeSemaphoreSnapshot
@@ -308,11 +313,22 @@ public:
         const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
         m_eeCycle += elapsed;
         m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+        // Upstream 75d729c clocks the IOP emulator here on every call. That is an out-of-line call on the hottest path
+        // (row 74 inlined this function), so the EE cycles are batched and handed over one IOP slice at a time
+        // (8 EE cycles per IOP cycle, 256-cycle slices = 2048 EE cycles; IopEmulator::runEeCycles keeps the remainder).
+        m_iopEeCyclesPending += elapsed;
+        if (__builtin_expect(m_iopEeCyclesPending >= kIopEeCycleBatch, 0))
+        {
+            m_runtime.advanceIopEeCycles(m_iopEeCyclesPending);
+            m_iopEeCyclesPending = 0u;
+        }
         if (m_pendingEeTimerInterrupts != 0u)
         {
             m_checkpointPending.store(true, std::memory_order_release);
         }
     }
+    static constexpr uint64_t kIopEeCycleBatch = 2048u;
+    uint64_t m_iopEeCyclesPending = 0u;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
@@ -428,6 +444,8 @@ private:
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
     void renewTimeSlice();
     void copyMainContextToRuntime();
+    void publishDebugContext(const R5900Context &context);
+    void publishIdleDebugContext();
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;

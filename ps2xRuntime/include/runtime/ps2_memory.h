@@ -481,6 +481,8 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+    void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
     // cont.245: mirror the PCSX2 IPU's DMA channels 3/4 back into the guest registers and raise their
     // end-of-transfer interrupts (a decode kicked by a later IPU command finishes a DMA armed earlier).
