@@ -257,35 +257,6 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
-    // Kept on merging upstream 75d729c (which removed it in favour of PS2RomDevice's rom0:ROMVER): rotk stubs
-    // GetRomName@0x263618 (EUR) / 0x2715C0 (USA) and its IsT10K reads this reply. Dropping the stub so the guest
-    // reads rom0:ROMVER itself is a separate experiment (upstream answers "0200AC...", a USA console).
-    void GetRomName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        uint32_t bufAddr = getRegU32(ctx, 4); // $a0
-        size_t bufSize = getRegU32(ctx, 5);   // $a1
-        char *hostBuf = reinterpret_cast<char *>(getMemPtr(rdram, bufAddr));
-        const char *romName = "ROMVER 0100";
-
-        if (!hostBuf)
-        {
-            std::cerr << "GetRomName error: Invalid buffer address" << std::endl;
-            setReturnS32(ctx, -1); // Error
-            return;
-        }
-        if (bufSize == 0)
-        {
-            setReturnS32(ctx, 0);
-            return;
-        }
-
-        strncpy(hostBuf, romName, bufSize - 1);
-        hostBuf[bufSize - 1] = '\0';
-
-        // returns the length of the string (excluding null?) or error
-        setReturnS32(ctx, (int32_t)strlen(hostBuf));
-    }
-
     void SifLoadElfPart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0 - path
