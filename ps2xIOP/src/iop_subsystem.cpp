@@ -219,6 +219,11 @@ namespace ps2x::iop
         return m_impl->emulator.softwareRegister(index);
     }
 
+    uint64_t IopSubsystem::iopCycles() const noexcept
+    {
+        return m_impl->emulator.cycles();
+    }
+
     void IopSubsystem::setSpu2Enabled(bool enabled)
     {
         m_impl->emulator.setSpu2Enabled(enabled);

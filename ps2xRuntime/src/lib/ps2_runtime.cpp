@@ -756,6 +756,8 @@ void PS2Runtime::setIopSpu2Enabled(bool enabled)
     if (!m_iopSubsystem)
         return;
     m_iopSubsystem->setSpu2Enabled(enabled);
+    m_iopSpu2Enabled = enabled;
+    m_iopTimeTarget = m_iopSubsystem->iopCycles();
     if (enabled)
     {
         ps2x::iop::IopSubsystem *iop = m_iopSubsystem.get();
@@ -766,6 +768,21 @@ void PS2Runtime::setIopSpu2Enabled(bool enabled)
     {
         m_audioBackend.spu2OutputClose();
     }
+}
+
+void PS2Runtime::syncIopToVblank(uint64_t vblankEeCycles) noexcept
+{
+    if (!m_iopSpu2Enabled || !m_iopSubsystem)
+        return;
+    const uint64_t frameIop = vblankEeCycles / 8u;
+    m_iopTimeTarget += frameIop;
+    const uint64_t now = m_iopSubsystem->iopCycles();
+    if (now >= m_iopTimeTarget)
+        return;   // the EE-driven clock is ahead: nothing to catch up
+    // At most 3 frames per tick: after a long stall, drop the backlog instead of running it in one burst.
+    if (m_iopTimeTarget - now > 3u * frameIop)
+        m_iopTimeTarget = now + 3u * frameIop;
+    m_iopSubsystem->runEeCycles((m_iopTimeTarget - now) * 8u);
 }
 
 bool PS2Runtime::sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,

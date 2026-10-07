@@ -325,6 +325,11 @@ public:
     // rotk row 273: the emulated IOP's SPU2 (PCSX2's core) -- OFF by default; a game running its own sound driver IRX on
     // the IOP turns it on (rotk: LOTR_IOP_LLE=1).
     void setIopSpu2Enabled(bool enabled);
+    // rotk row 274: called at every vblank with the vblank period in EE cycles. While the SPU2 is on, the IOP is brought
+    // up to the console time that has passed (36.864 MHz = EE / 8): on hardware it runs at a fixed rate, but here it is
+    // otherwise clocked only by the EE cycles the recompiled code accounts, which fall well behind real time (and stop
+    // while the EE waits) -- the SPU2 then mixes too few samples and the host stream underruns.
+    void syncIopToVblank(uint64_t vblankEeCycles) noexcept;
     [[nodiscard]] bool iopSifCommandForwarding() const noexcept { return m_iopSifCommandForwarding; }
     bool sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
                            uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
@@ -528,6 +533,8 @@ private:
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     std::atomic<bool> m_iopSifCommandForwarding{false};
     uint32_t m_sifHandlerStack = 0u;   // rotk row 269: guest stack for runPendingSifCommandHandlers
+    bool m_iopSpu2Enabled = false;     // rotk row 274
+    uint64_t m_iopTimeTarget = 0u;     // rotk row 274: IOP cycles the console clock says have passed
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

@@ -2591,6 +2591,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        m_runtime.syncIopToVblank(vblankPeriodCycles());   // rotk row 274: the IOP keeps console time
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
