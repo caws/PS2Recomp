@@ -1,4 +1,6 @@
 #include "ps2_runtime.h"
+#include "ps2x/iop/iop_native_bridge.h"
+namespace ps2x::iop::native { IopNativeExecutor *defaultExecutor(); }   // ps2_iop_native.cpp (rotk row 276)
 #include "ps2_shutdown.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
@@ -623,6 +625,8 @@ PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+    if (ps2x::iop::IopNativeExecutor *executor = ps2x::iop::native::defaultExecutor())   // rotk row 276
+        m_iopSubsystem->setNativeExecutor(executor);
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
 

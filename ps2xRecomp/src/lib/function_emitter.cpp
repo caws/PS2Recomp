@@ -129,6 +129,10 @@ namespace ps2recomp
                 constantRegisters.clear();
                 ss << "label_" << std::hex << inst.address << std::dec << ":\n";
             }
+            // rotk row 276: an IOP module counts its instructions -- the IOP's clock is one cycle per instruction, and
+            // the host turns the count into IOP time (DMA, SPU2, timers), as the interpreter does.
+            if (cg.arch() == Arch::R3000)
+                ss << "    ++ctx->insn_count;\n";
 
             if (cg.m_emitInstructionComments)
             {

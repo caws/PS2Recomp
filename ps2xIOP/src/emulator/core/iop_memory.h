@@ -141,6 +141,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool spu2Enabled() const noexcept { return m_spu2Enabled; }
         void spu2DmaComplete(int core);
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        [[nodiscard]] uint8_t *ramData() noexcept { return m_ram.data(); }        // rotk row 276: native modules
+        [[nodiscard]] uint8_t *ownedData() noexcept { return m_owned.data(); }
 
         [[nodiscard]] static constexpr uint32_t physicalAddress(uint32_t address) noexcept { return address & 0x1FFFFFFFu; }
 

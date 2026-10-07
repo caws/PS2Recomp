@@ -2,6 +2,7 @@
 
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/iop/iop_native_bridge.h"
 
 #include <memory>
 #include <string>
@@ -41,6 +42,8 @@ namespace ps2x::iop
         [[nodiscard]] uint32_t iopSoftwareRegister(uint32_t index) const noexcept;
         // rotk row 273: emulate the SPU2 (PCSX2's core) behind the IOP's sound registers and DMA 4/7. OFF by default.
         void setSpu2Enabled(bool enabled);
+        // rotk row 276: run statically recompiled IOP modules through `executor` (nullptr = interpret everything).
+        void setNativeExecutor(IopNativeExecutor *executor);
         [[nodiscard]] uint64_t iopCycles() const noexcept;   // the emulated IOP's cycle count
         // The SPU2's mixed output (48 kHz interleaved stereo s16), oldest first; returns frames copied.
         size_t takeSpu2Samples(int16_t *destination, size_t maxFrames);

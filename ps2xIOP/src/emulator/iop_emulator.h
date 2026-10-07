@@ -2,6 +2,7 @@
 
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/iop/iop_native_bridge.h"
 
 #include <cstdint>
 #include <memory>
@@ -31,6 +32,7 @@ namespace ps2x::iop::detail
                              uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
         [[nodiscard]] uint32_t softwareRegister(uint32_t index) const noexcept;
         void setSpu2Enabled(bool enabled);
+        void setNativeExecutor(ps2x::iop::IopNativeExecutor *executor);   // rotk row 276
         void onSifTransfer(const SifTransfer &transfer);
 
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);

@@ -202,6 +202,12 @@ else
     GAME_SRC_ROOTS=("$GAME_DIR/src")
     [[ -d "$GAME_DIR/mods" ]] && GAME_SRC_ROOTS+=("$GAME_DIR/mods")
 fi
+# rotk rows 275-276: statically recompiled IOP modules, from the game's config.toml [iop_native] section (none = nothing
+# generated). Generated per build from the disc's IRX into <game_dir>/tmp/iop_native/, compiled with the overrides.
+source "$SCRIPT_DIR/ps2x-iop-native.sh"
+gen_iop_native "$GAME_DIR" "$CONFIG" "$(dirname "$ELF")" "$GAME_DIR/tmp/iop_native" || exit 1
+[[ -d "$GAME_DIR/tmp/iop_native" ]] && GAME_SRC_ROOTS+=("$GAME_DIR/tmp/iop_native")
+
 GAME_SRC_FILES=()
 while IFS= read -r -d '' f; do GAME_SRC_FILES+=("$f"); done \
     < <(find "${GAME_SRC_ROOTS[@]}" -type f \( -name '*.cpp' -o -name '*.h' \) -print0 | sort -z)

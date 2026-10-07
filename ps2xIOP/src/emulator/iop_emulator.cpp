@@ -17,6 +17,7 @@
 #include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
 #include "spu2/ps2x_spu2.h"
+#include "ps2x/iop/iop_native_bridge.h"
 
 #include <algorithm>
 #include <chrono>
@@ -72,7 +73,7 @@ namespace ps2x::iop::detail
 
     }
 
-    class IopEmulator::Impl final : public IopGuestExecutor, public ps2x::spu2::Host
+    class IopEmulator::Impl final : public IopGuestExecutor, public ps2x::spu2::Host, public ps2x::iop::IopNativeServices
     {
     public:
         using CpuState = IopCpuState;
@@ -148,6 +149,82 @@ namespace ps2x::iop::detail
             secrMcCommandHandler = {};
             secrMcDevIdHandler = {};
             checkKelfPathCallback = {};
+        }
+
+        // ---- rotk row 276: statically recompiled modules (IopNativeServices) --------------------------------------
+        ps2x::iop::IopNativeExecutor *nativeExecutor = nullptr;
+        CpuState *nativeCpu = nullptr;          // the thread native code is running for
+        uint64_t nativeBudgetEnd = 0u;          // runCpu's instruction budget, as an absolute count
+
+        uint8_t *ram() override { return memory.ramData(); }
+        uint8_t *owned() override { return memory.ownedData(); }
+
+        uint32_t read(uint32_t address, unsigned bytes) override
+        {
+            return bytes == 1u ? memory.read8(address) : bytes == 2u ? memory.read16(address) : memory.read32(address);
+        }
+
+        void write(uint32_t address, uint32_t value, unsigned bytes) override
+        {
+            if (bytes == 1u)
+                write8(address, static_cast<uint8_t>(value));
+            else if (bytes == 2u)
+                write16(address, static_cast<uint16_t>(value));
+            else
+                write32(address, value);
+        }
+
+        bool callImport(ps2x::iop::IopNativeCpu &, uint32_t stubAddress, std::string_view library, uint16_t ordinal) override
+        {
+            // As stepImportStub: the import's HLE (or the jump into the exporting module), then the stub's `jr ra`.
+            CpuState &cpu = *nativeCpu;
+            const auto decoded = imports.decode(stubAddress);
+            const IopImportCall call = decoded ? *decoded : IopImportCall{std::string(library), ordinal, 0u};
+            const ImportDisposition disposition = dispatchImport(call, cpu);
+            ++totalInstructions;
+            ++totalCycles;
+            if (disposition != ImportDisposition::JumpToGuest)
+            {
+                cpu.pc = cpu.gpr[31];
+                cpu.branchPending = false;
+            }
+            return !cpu.stopped && !cpu.yielded;
+        }
+
+        void account(uint32_t instructions) override
+        {
+            totalInstructions += instructions;
+            totalCycles += instructions;
+        }
+
+        bool breakRequested() override
+        {
+            const CpuState &cpu = *nativeCpu;
+            if (cpu.stopped || cpu.yielded || totalInstructions >= nativeBudgetEnd)
+                return true;
+            if (!pendingDmaInterrupts.empty() || !pendingGuestCallbacks.empty() || rpc.hasPendingEeCommands())
+                return true;
+            if (memory.spu2Enabled() && totalCycles - spu2LastAdvance >= kSpu2TickCycles)
+                return true;   // the SPU2 (and its DMA completions) advance in runCpu, between native runs
+            const uint32_t status = cpu.cop0[12];
+            return (status & 1u) != 0u && (status & 2u) == 0u && memory.interruptControl() != 0u &&
+                   (memory.interruptStatus() & memory.interruptMask()) != 0u;
+        }
+
+        void setNativeExecutor(ps2x::iop::IopNativeExecutor *executor)
+        {
+            nativeExecutor = executor;
+        }
+
+        bool stepNative(CpuState &cpu)
+        {
+            ps2x::iop::IopNativeCpu view{cpu.gpr.data(), &cpu.hi, &cpu.lo, &cpu.pc, &cpu.stopped, &cpu.yielded};
+            CpuState *previous = nativeCpu;
+            nativeCpu = &cpu;
+            nativeExecutor->run(view, *this);
+            nativeCpu = previous;
+            schedulePendingDma();
+            return !cpu.stopped;
         }
 
         // ---- rotk row 273: the SPU2 core's view of this IOP (ps2x::spu2::Host) --------------------------------------
@@ -454,6 +531,11 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
+            // rotk row 276: a statically recompiled module's code runs natively (at a function or resume entry, with no
+            // branch or load delay in flight).
+            if (nativeExecutor && !cpu.branchPending && !cpu.pendingLoad && nativeExecutor->has(cpu.pc))
+                return stepNative(cpu);
+
             // Import stubs are `jr ra; addiu zero,zero,<ordinal>`: only that word can be one (rotk row 272: test it
             // inline instead of an out-of-line decode() per instruction).
             if (memory.read32(cpu.pc) == 0x03E00008u)
@@ -529,6 +611,14 @@ namespace ps2x::iop::detail
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
+            const uint64_t previousBudgetEnd = nativeBudgetEnd;
+            nativeBudgetEnd = start + instructionBudget;
+            struct BudgetRestore
+            {
+                uint64_t &slot;
+                uint64_t value;
+                ~BudgetRestore() { slot = value; }
+            } budgetRestore{nativeBudgetEnd, previousBudgetEnd};
             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
                 if (!step(cpu))
@@ -791,6 +881,8 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
+            if (nativeExecutor)   // rotk row 276: bind recompiled code before the module's own start runs
+                nativeExecutor->onModuleLoaded(module.name, image.data(), image.size(), module.base, module.size);
             const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
             if (args)
                 freeAllocation(args);
@@ -835,6 +927,8 @@ namespace ps2x::iop::detail
             if (it == modules.end())
                 return false;
             // A removable IRX normally exposes a stop entry through module metadata. We do not guess it; terminate owned execution and release the image cleanly.
+            if (nativeExecutor)
+                nativeExecutor->onModuleUnloaded(it->second.base, it->second.size);
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
@@ -925,6 +1019,11 @@ namespace ps2x::iop::detail
                                       uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize)
     {
         return m_impl->rpc.queueEeCommand(cid, packet, packetSize, eeExtraSource, iopExtraDestination, extraSize);
+    }
+
+    void IopEmulator::setNativeExecutor(ps2x::iop::IopNativeExecutor *executor)
+    {
+        m_impl->setNativeExecutor(executor);
     }
 
     void IopEmulator::setSpu2Enabled(bool enabled)

@@ -219,6 +219,11 @@ namespace ps2x::iop
         return m_impl->emulator.softwareRegister(index);
     }
 
+    void IopSubsystem::setNativeExecutor(IopNativeExecutor *executor)
+    {
+        m_impl->emulator.setNativeExecutor(executor);
+    }
+
     uint64_t IopSubsystem::iopCycles() const noexcept
     {
         return m_impl->emulator.cycles();
