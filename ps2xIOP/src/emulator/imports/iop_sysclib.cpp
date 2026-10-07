@@ -16,6 +16,122 @@ namespace ps2x::iop::detail
     {
     }
 
+
+    namespace
+    {
+        // printf-style formatting of a guest format string; nextWord() yields the next 32-bit argument slot,
+        // alignPair() rounds the slot index up to even before a 64-bit argument (o32 register/stack pairing).
+        template <typename NextWord, typename AlignPair>
+        std::string formatGuestString(IopMemory &memory, const std::string &format, NextWord nextWord, AlignPair alignPair)
+        {
+            std::string out;
+            for (size_t i = 0; i < format.size(); ++i)
+            {
+                const char c = format[i];
+                if (c != '%')
+                {
+                    out.push_back(c);
+                    continue;
+                }
+                if (++i >= format.size())
+                    break;
+                bool left = false, plus = false, space = false, alt = false, zero = false;
+                for (;; ++i)
+                {
+                    const char f = format[i];
+                    if (f == '-') left = true;
+                    else if (f == '+') plus = true;
+                    else if (f == ' ') space = true;
+                    else if (f == '#') alt = true;
+                    else if (f == '0') zero = true;
+                    else break;
+                    if (i + 1u >= format.size()) break;
+                }
+                int width = 0;
+                if (i < format.size() && format[i] == '*')
+                {
+                    width = static_cast<int32_t>(nextWord());
+                    if (width < 0) { left = true; width = -width; }
+                    ++i;
+                }
+                else
+                    while (i < format.size() && format[i] >= '0' && format[i] <= '9') width = width * 10 + (format[i++] - '0');
+                int precision = -1;
+                if (i < format.size() && format[i] == '.')
+                {
+                    ++i;
+                    precision = 0;
+                    if (i < format.size() && format[i] == '*') { precision = static_cast<int32_t>(nextWord()); ++i; }
+                    else
+                        while (i < format.size() && format[i] >= '0' && format[i] <= '9') precision = precision * 10 + (format[i++] - '0');
+                }
+                int longs = 0;
+                bool half = false;
+                while (i < format.size() && (format[i] == 'l' || format[i] == 'h'))
+                {
+                    if (format[i] == 'l') ++longs; else half = true;
+                    ++i;
+                }
+                if (i >= format.size())
+                    break;
+                const char conv = format[i];
+                std::string body, prefix;
+                switch (conv)
+                {
+                case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': case 'p':
+                {
+                    uint64_t value = 0u;
+                    if (longs >= 2) { alignPair(); value = nextWord(); value |= static_cast<uint64_t>(nextWord()) << 32; }
+                    else value = nextWord();
+                    bool negative = false;
+                    if (conv == 'd' || conv == 'i')
+                    {
+                        int64_t sv = longs >= 2 ? static_cast<int64_t>(value) : half ? static_cast<int16_t>(value) : static_cast<int32_t>(value);
+                        if (sv < 0) { negative = true; value = static_cast<uint64_t>(-sv); } else value = static_cast<uint64_t>(sv);
+                    }
+                    else if (half) value &= 0xFFFFu;
+                    const unsigned base = (conv == 'o') ? 8u : (conv == 'x' || conv == 'X' || conv == 'p') ? 16u : 10u;
+                    const char *digits = (conv == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
+                    do { body.insert(body.begin(), digits[value % base]); value /= base; } while (value);
+                    if (precision == 0 && body == "0") body.clear();
+                    while (precision > 0 && static_cast<int>(body.size()) < precision) body.insert(body.begin(), '0');
+                    if (negative) prefix = "-"; else if (plus && (conv == 'd' || conv == 'i')) prefix = "+";
+                    else if (space && (conv == 'd' || conv == 'i')) prefix = " ";
+                    if ((alt && (conv == 'x' || conv == 'X') && !body.empty() && body != "0") || conv == 'p') prefix += (conv == 'X') ? "0X" : "0x";
+                    if (alt && conv == 'o' && (body.empty() || body[0] != '0')) body.insert(body.begin(), '0');
+                    if (zero && !left && precision < 0)
+                        while (static_cast<int>(prefix.size() + body.size()) < width) body.insert(body.begin(), '0');
+                    break;
+                }
+                case 'c':
+                    body.push_back(static_cast<char>(nextWord() & 0xFFu));
+                    break;
+                case 's':
+                {
+                    const uint32_t address = nextWord();
+                    body = address ? memory.readString(address, 4096u) : std::string("(null)");
+                    if (precision >= 0 && static_cast<int>(body.size()) > precision) body.resize(static_cast<size_t>(precision));
+                    break;
+                }
+                case '%':
+                    body = "%";
+                    break;
+                default: // unknown conversion: emit it as written
+                    body = std::string("%") + conv;
+                    break;
+                }
+                std::string field = prefix + body;
+                if (static_cast<int>(field.size()) < width)
+                {
+                    const std::string pad(static_cast<size_t>(width) - field.size(), ' ');
+                    field = left ? field + pad : pad + field;
+                }
+                out += field;
+            }
+            return out;
+        }
+    }
+
     bool IopSysclib::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
     {
         const uint32_t a0 = cpu.gpr[4];
@@ -124,15 +240,35 @@ namespace ps2x::iop::detail
         case 18: // prnt
             setV0(0);
             return true;
-        case 19: // sprintf: preserve useful literal formats even before full vararg formatting.
-        case 42: // vsprintf fallback: copy format literal.
+        case 19: // sprintf(buf, fmt, ...)
+        case 42: // vsprintf(buf, fmt, va_list)
         {
-            const std::string format = m_memory.readString(a1, 4096u);
-            for (size_t i = 0; i <= format.size(); ++i)
+            // rotk row 270: real formatting (upstream copied the format literally, so AUDIOPF's FormatCDPath
+            // `sprintf(path, "\\%s;1", name)` searched the disc for "\%s;1"). The IOP is o32: sprintf's variadic
+            // arguments are a2, a3, then the caller's stack from sp+16; vsprintf's va_list is a pointer to 4-byte
+            // slots. Conversions/flags as ps2sdk iop/system/sysclib (prnt): d i u o x X c s p %, -+ #0, width/precision
+            // (incl. *), h/l/ll (ll takes an 8-byte-aligned pair).
+            const uint32_t sp = cpu.gpr[29];
+            uint32_t slot = 0u;
+            const auto nextWord = [&]() -> uint32_t
             {
-                m_memory.write8(a0 + static_cast<uint32_t>(i), i < format.size() ? static_cast<uint8_t>(format[i]) : 0u);
-            }
-            setV0(static_cast<uint32_t>(format.size()));
+                uint32_t value = 0u;
+                if (ordinal == 42u)
+                    value = m_memory.read32(a2 + slot * 4u);
+                else if (slot == 0u)
+                    value = cpu.gpr[6];
+                else if (slot == 1u)
+                    value = cpu.gpr[7];
+                else
+                    value = m_memory.read32(sp + 16u + (slot - 2u) * 4u);
+                ++slot;
+                return value;
+            };
+            const std::string text = formatGuestString(m_memory, m_memory.readString(a1, 4096u), nextWord, [&]()
+                                                       { slot = (slot + 1u) & ~1u; });
+            for (size_t i = 0; i <= text.size(); ++i)
+                m_memory.write8(a0 + static_cast<uint32_t>(i), i < text.size() ? static_cast<uint8_t>(text[i]) : 0u);
+            setV0(static_cast<uint32_t>(text.size()));
             return true;
         }
         case 20:
