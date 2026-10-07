@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <x86intrin.h>
 #include <functional>
 #include <vector>
 #include <cstdio>
@@ -181,6 +182,8 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
+            if (!memory.hasDmaStart())
+                return;
             if (const auto dma = memory.takeDmaStart())
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
         }
@@ -378,6 +381,27 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        // The rare half of step(), kept out of line so step() itself stays small (rotk row 272): true = pc was an import stub
+        // and was dispatched; `running` = step()'s result.
+        [[gnu::noinline]] bool stepImportStub(CpuState &cpu, bool &running)
+        {
+            const auto import = imports.decode(cpu.pc);
+            if (!import)
+                return false;
+            const ImportDisposition disposition = dispatchImport(*import, cpu);
+            ++totalInstructions;
+            ++totalCycles;
+            if (disposition == ImportDisposition::JumpToGuest)
+            {
+                running = true;
+                return true;
+            }
+            cpu.pc = cpu.gpr[31];
+            cpu.branchPending = false;
+            running = !cpu.stopped;
+            return true;
+        }
+
         bool step(CpuState &cpu)
         {
             if (cpu.stopped)
@@ -398,16 +422,13 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
-            if (const auto import = imports.decode(cpu.pc))
+            // Import stubs are `jr ra; addiu zero,zero,<ordinal>`: only that word can be one (rotk row 272: test it
+            // inline instead of an out-of-line decode() per instruction).
+            if (memory.read32(cpu.pc) == 0x03E00008u)
             {
-                const ImportDisposition disposition = dispatchImport(*import, cpu);
-                ++totalInstructions;
-                ++totalCycles;
-                if (disposition == ImportDisposition::JumpToGuest)
-                    return true;
-                cpu.pc = cpu.gpr[31];
-                cpu.branchPending = false;
-                return !cpu.stopped;
+                bool running = true;
+                if (stepImportStub(cpu, running))
+                    return running;
             }
 
             // PS2X_IOP_PCPROF=<seconds> (diagnostic, default OFF; rotk row 271): a histogram of executed IOP pcs,
@@ -611,6 +632,32 @@ namespace ps2x::iop::detail
         }
 
         void runCycles(uint64_t cycles) noexcept
+        {
+            // PS2X_IOP_PERF=<seconds> (diagnostic, default OFF; rotk row 272): host TSC ticks spent in this function per
+            // IOP instruction executed, printed every <seconds> -- the interpreter's cost per guest instruction.
+            static const int s_perf = [] { const char *e = std::getenv("PS2X_IOP_PERF"); return e ? std::atoi(e) : 0; }();
+            if (s_perf > 0)
+            {
+                static uint64_t s_ticks = 0u, s_instr = 0u;
+                static auto s_last = std::chrono::steady_clock::now();
+                const uint64_t t0 = __rdtsc(), i0 = totalInstructions;
+                runCyclesImpl(cycles);
+                s_ticks += __rdtsc() - t0;
+                s_instr += totalInstructions - i0;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - s_last >= std::chrono::seconds(s_perf))
+                {
+                    std::fprintf(stderr, "[iop:perf] %llu instructions, %.1f TSC ticks/instruction\n",
+                                 static_cast<unsigned long long>(s_instr), s_instr ? double(s_ticks) / double(s_instr) : 0.0);
+                    s_last = now;
+                    s_ticks = s_instr = 0u;
+                }
+                return;
+            }
+            runCyclesImpl(cycles);
+        }
+
+        void runCyclesImpl(uint64_t cycles) noexcept
         {
             try
             {

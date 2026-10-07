@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iterator>
 #include <utility>
 
 namespace ps2x::iop::detail
@@ -43,12 +44,15 @@ namespace ps2x::iop::detail
     void IopImportRegistry::reset()
     {
         m_libraries.clear();
+        m_decoded.clear();
     }
 
     std::optional<IopImportCall> IopImportRegistry::decode(uint32_t pc) const
     {
         if (m_memory.read32(pc) != 0x03E00008u)
             return std::nullopt;
+        if (const auto cached = m_decoded.find(pc); cached != m_decoded.end())
+            return cached->second;
         const uint32_t delay = m_memory.read32(pc + 4u);
         if ((delay & 0xFFFF0000u) != 0x24000000u)
             return std::nullopt;
@@ -89,11 +93,13 @@ namespace ps2x::iop::detail
             }
             if (valid)
             {
-                return IopImportCall{
+                IopImportCall call{
                     trimLibraryName(name),
                     static_cast<uint16_t>(delay & 0xFFFFu),
                     m_memory.read16(table + 8u),
                 };
+                m_decoded.emplace(pc, call);
+                return call;
             }
         }
         return std::nullopt;
@@ -184,6 +190,11 @@ namespace ps2x::iop::detail
 
     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
     {
+        for (auto it = m_decoded.begin(); it != m_decoded.end();)
+        {
+            const uint32_t physical = IopMemory::physicalAddress(it->first);
+            it = (physical >= base && physical < base + size) ? m_decoded.erase(it) : std::next(it);
+        }
         for (auto library = m_libraries.begin(); library != m_libraries.end();)
         {
             if (library->first >= base && library->first < base + size)

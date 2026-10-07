@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace ps2x::iop::detail
@@ -46,5 +47,8 @@ namespace ps2x::iop::detail
 
         IopMemory &m_memory;
         std::map<uint32_t, ExportLibrary> m_libraries;
+        // rotk row 272: decoded import stubs by pc. A stub is part of a loaded module's image (written once at load), so
+        // a hit stays valid until the module goes (eraseRange) or the IOP resets.
+        mutable std::unordered_map<uint32_t, IopImportCall> m_decoded;
     };
 }
