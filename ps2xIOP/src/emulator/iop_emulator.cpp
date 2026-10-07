@@ -18,6 +18,9 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -407,11 +410,46 @@ namespace ps2x::iop::detail
                 return !cpu.stopped;
             }
 
+            // PS2X_IOP_PCPROF=<seconds> (diagnostic, default OFF; rotk row 271): a histogram of executed IOP pcs,
+            // the top 40 printed every <seconds> of host time -- which guest loop the IOP's time goes to.
+            static const int s_pcProf = [] { const char *e = std::getenv("PS2X_IOP_PCPROF"); return e ? std::atoi(e) : 0; }();
+            if (s_pcProf > 0)
+                profilePc(cpu.pc, s_pcProf);
             const bool running = cpuCore.executeInstruction(cpu);
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
             return running;
+        }
+
+        void profilePc(uint32_t pc, int periodSeconds)
+        {
+            static std::vector<uint32_t> s_hist(kRamSize / 4u, 0u);
+            static auto s_last = std::chrono::steady_clock::now();
+            ++s_hist[(physicalAddress(pc) % kRamSize) / 4u];
+            static uint32_t s_tick = 0u;
+            if ((++s_tick & 0xFFFFu) != 0u)
+                return;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_last < std::chrono::seconds(periodSeconds))
+                return;
+            s_last = now;
+            std::vector<std::pair<uint32_t, uint32_t>> top;
+            uint64_t total = 0u;
+            for (uint32_t i = 0; i < s_hist.size(); ++i)
+                if (s_hist[i]) { top.emplace_back(s_hist[i], i * 4u); total += s_hist[i]; }
+            std::sort(top.begin(), top.end(), std::greater<>());
+            std::fprintf(stderr, "[iop:pcprof] %llu instructions; top pcs:\n", static_cast<unsigned long long>(total));
+            for (size_t i = 0; i < top.size() && i < 40u; ++i)
+            {
+                const Module *owner = nullptr;
+                for (const auto &[id, module] : modules)
+                    if (top[i].second >= module.base && top[i].second < module.base + module.size)
+                        owner = &module;
+                std::fprintf(stderr, "[iop:pcprof]   %08x %6.2f%% %s+0x%x\n", top[i].second, 100.0 * top[i].first / static_cast<double>(total),
+                             owner ? owner->name.c_str() : "?", owner ? top[i].second - owner->base : top[i].second);
+            }
+            std::fill(s_hist.begin(), s_hist.end(), 0u);
         }
 
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)

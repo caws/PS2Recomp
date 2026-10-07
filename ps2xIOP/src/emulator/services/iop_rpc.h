@@ -3,6 +3,7 @@
 #include "ps2x/iop/iop_types.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -118,5 +119,6 @@ namespace ps2x::iop::detail
         bool m_servicingEeCommands = false;
         mutable std::mutex m_eeCommandMutex;
         std::deque<PendingEeCommand> m_eeCommands;
+        std::atomic<uint32_t> m_eeCommandCount{0u};   // checked every IOP instruction: no lock on the empty path
     };
 }

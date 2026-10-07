@@ -35,6 +35,7 @@ namespace ps2x::iop::detail
         m_servicingEeCommands = false;
         std::lock_guard<std::mutex> lock(m_eeCommandMutex);
         m_eeCommands.clear();
+        m_eeCommandCount.store(0u, std::memory_order_release);
     }
 
     namespace
@@ -99,13 +100,13 @@ namespace ps2x::iop::detail
         std::memcpy(command.packet.data() + 8u, &cid, sizeof(cid));
         std::lock_guard<std::mutex> lock(m_eeCommandMutex);
         m_eeCommands.push_back(command);
+        m_eeCommandCount.fetch_add(1u, std::memory_order_release);
         return true;
     }
 
     bool IopRpcBridge::hasPendingEeCommands() const
     {
-        std::lock_guard<std::mutex> lock(m_eeCommandMutex);
-        return !m_eeCommands.empty();
+        return m_eeCommandCount.load(std::memory_order_acquire) != 0u;
     }
 
     // The handlers sifcmd installs for itself at InitCmd (ps2sdk sifcmd.c _change_addr / _set_sreg /
@@ -140,6 +141,7 @@ namespace ps2x::iop::detail
                     break;
                 command = m_eeCommands.front();
                 m_eeCommands.pop_front();
+                m_eeCommandCount.fetch_sub(1u, std::memory_order_acq_rel);
             }
             uint32_t cid = 0u;
             std::memcpy(&cid, command.packet.data() + 8u, sizeof(cid));
