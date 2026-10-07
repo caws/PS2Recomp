@@ -99,6 +99,15 @@ namespace ps2recomp
             return 1;
         }
 
+        // rotk row 275: an IOP module (R3000) is generated inside its own namespace, against the IOP native-module host
+        // (ps2x_iop_native.h), whose `PS2Runtime` alias in that namespace stands in for the EE runtime.
+        void writeIopPreamble(std::ostream &output, const std::string &ns)
+        {
+            output << "#include \"ps2x_iop_native.h\"\n";
+            output << "#include \"" << ns << "_functions.h\"\n\n";   // this module's, not the EE's
+            output << "namespace " << ns << " {\n\n";
+        }
+
         void writeCombinedOutputPreamble(std::ostream &output)
         {
             output << "#include <stdexcept>\n";
@@ -1023,6 +1032,12 @@ namespace ps2recomp
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->setArch(m_config.arch, m_config.iopNamespace, m_config.iopRegisterSymbol);   // rotk row 275
+            if (m_config.arch == Arch::R3000)
+            {
+                m_bootstrapInfo = {};   // an IOP module has no EE start-up (gp/bss bootstrap)
+                m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
+            }
 
             fs::create_directories(m_config.outputPath);
 
@@ -1374,14 +1389,21 @@ namespace ps2recomp
 
             if (m_config.singleFileOutput)
             {
-                fs::path outputPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.cpp";
+                // rotk row 275: an IOP module's files are named after its namespace -- the game build installs override
+                // sources flat into the runner, next to the EE's own ps2_recompiled_functions.*.
+                fs::path outputPath = fs::path(m_config.outputPath) /
+                                      (m_config.arch == Arch::R3000 ? m_config.iopNamespace + "_functions.cpp"
+                                                                    : std::string("ps2_recompiled_functions.cpp"));
                 std::ofstream combinedOutput(outputPath);
                 if (!combinedOutput)
                 {
                     throw std::runtime_error("Failed to open combined output: " + outputPath.string());
                 }
 
-                writeCombinedOutputPreamble(combinedOutput);
+                if (m_config.arch == Arch::R3000)
+                    writeIopPreamble(combinedOutput, m_config.iopNamespace);
+                else
+                    writeCombinedOutputPreamble(combinedOutput);
 
                 if (outputWorkerCount <= 1)
                 {
@@ -1572,6 +1594,8 @@ namespace ps2recomp
                     }
                 }
 
+                if (m_config.arch == Arch::R3000)
+                    combinedOutput << "} // namespace " << m_config.iopNamespace << "\n";
                 combinedOutput.close();
                 if (!combinedOutput)
                 {
@@ -1771,7 +1795,9 @@ namespace ps2recomp
             std::string registerFunctions = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
             m_generatedStubs.clear();
 
-            fs::path registerPath = fs::path(m_config.outputPath) / "register_functions.cpp";
+            fs::path registerPath = fs::path(m_config.outputPath) /
+                                    (m_config.arch == Arch::R3000 ? m_config.iopNamespace + "_register.cpp"
+                                                                  : std::string("register_functions.cpp"));
             if (!writeToFile(registerPath.string(), registerFunctions))
             {
                 throw std::runtime_error("Failed to write function registration file: " + registerPath.string());
@@ -1782,7 +1808,7 @@ namespace ps2recomp
                 m_reporter.progress(msg.str());
             }
 
-            if (!generateStubHeader())
+            if (m_config.arch != Arch::R3000 && !generateStubHeader())   // an IOP module has no EE stubs
             {
                 throw std::runtime_error("Failed to generate stub header");
             }
@@ -1856,12 +1882,21 @@ namespace ps2recomp
         {
             std::stringstream ss;
 
-            ss << "#ifndef PS2_RECOMPILED_FUNCTIONS_H\n";
-            ss << "#define PS2_RECOMPILED_FUNCTIONS_H\n\n";
+            const std::string guard = m_config.arch == Arch::R3000 ? m_config.iopNamespace + "_FUNCTIONS_H"
+                                                                   : std::string("PS2_RECOMPILED_FUNCTIONS_H");
+            ss << "#ifndef " << guard << "\n";
+            ss << "#define " << guard << "\n\n";
 
             ss << "#include <cstdint>\n\n";
             ss << "struct R5900Context;\n";
-            ss << "class PS2Runtime;\n\n";
+            if (m_config.arch == Arch::R3000)
+            {
+                ss << "#include \"ps2x_iop_native.h\"\n";
+                ss << "namespace " << m_config.iopNamespace << " {\n";
+                ss << "using PS2Runtime = ::ps2x::iop::native::Host;\n\n";
+            }
+            else
+                ss << "class PS2Runtime;\n\n";
 
             for (const auto &function : m_functions)
             {
@@ -1875,9 +1910,13 @@ namespace ps2recomp
                 ss << "void " << finalName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
             }
 
-            ss << "\n#endif // PS2_RECOMPILED_FUNCTIONS_H\n";
+            if (m_config.arch == Arch::R3000)
+                ss << "} // namespace " << m_config.iopNamespace << "\n";
+            ss << "\n#endif // " << guard << "\n";
 
-            fs::path headerPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.h";
+            fs::path headerPath = fs::path(m_config.outputPath) /
+                                  (m_config.arch == Arch::R3000 ? m_config.iopNamespace + "_functions.h"
+                                                                : std::string("ps2_recompiled_functions.h"));
             writeToFile(headerPath.string(), ss.str());
 
             {

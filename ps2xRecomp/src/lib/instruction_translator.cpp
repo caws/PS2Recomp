@@ -130,6 +130,23 @@ namespace ps2recomp
 
     std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
+        // rotk row 275: the IOP (R3000) is MIPS I -- an EE-only instruction in a module is not code (or not ours).
+        if (m_codeGenerator.arch() == Arch::R3000)
+        {
+            if (inst.isMMI || inst.isVU)
+                return m_codeGenerator.emitUnhandledInstruction(inst, "EE-only (MMI/VU) instruction in an IOP module");
+            switch (inst.opcode)
+            {
+            case OPCODE_COP1: case OPCODE_COP2:
+            case OPCODE_LQ: case OPCODE_SQ: case OPCODE_LD: case OPCODE_SD:
+            case OPCODE_LDL: case OPCODE_LDR: case OPCODE_SDL: case OPCODE_SDR:
+            case OPCODE_LWC1: case OPCODE_SWC1: case OPCODE_LDC2: case OPCODE_SDC2:
+            case OPCODE_DADDI: case OPCODE_DADDIU:
+                return m_codeGenerator.emitUnhandledInstruction(inst, "EE-only instruction in an IOP module");
+            default:
+                break;
+            }
+        }
         if (inst.isMMI)
         {
             return m_codeGenerator.translateMMIInstruction(inst);

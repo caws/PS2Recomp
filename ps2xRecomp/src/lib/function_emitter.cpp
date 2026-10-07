@@ -84,6 +84,20 @@ namespace ps2recomp
         }
 
         ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+
+        // rotk row 275: an IRX import stub (`jr ra; addiu zero,zero,<ordinal>`, named __iopimport_<library>_<ordinal> by
+        // ps2x_irx_image) becomes a call into the IOP's import handling, which also does the stub's `jr ra` (or jumps to
+        // the exporting module).
+        if (cg.arch() == Arch::R3000 && function.name.rfind("__iopimport_", 0) == 0)
+        {
+            const std::string rest = function.name.substr(12);
+            const size_t sep = rest.rfind('_');
+            const std::string library = sep == std::string::npos ? rest : rest.substr(0, sep);
+            const std::string ordinal = sep == std::string::npos ? "0" : rest.substr(sep + 1);
+            ss << "    runtime->iopImport(rdram, ctx, \"" << library << "\", " << ordinal << "u);\n";
+            ss << "}\n";
+            return ss.str();
+        }
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";

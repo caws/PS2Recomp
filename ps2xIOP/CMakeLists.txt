@@ -63,6 +63,12 @@ target_include_directories(ps2_iop
 
 add_library(ps2x::iop ALIAS ps2_iop)
 
+# rotk row 275: build-time tool -- an IRX relocated by this library's own loader into a plain MIPS ELF for ps2xRecomp's
+# R3000 mode (see tools/ps2x_irx_image.cpp).
+add_executable(ps2x_irx_image tools/ps2x_irx_image.cpp)
+target_link_libraries(ps2x_irx_image PRIVATE ps2_iop)
+target_include_directories(ps2x_irx_image PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 if(PS2X_IOP_BUILD_TESTS)
     enable_testing()
     add_executable(ps2_iop_emulator_tests tests/iop_emulator_tests.cpp)

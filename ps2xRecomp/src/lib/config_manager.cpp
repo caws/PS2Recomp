@@ -38,6 +38,12 @@ namespace ps2recomp
             const auto &general = toml::find(data, "general");
 
             config.inputPath = toml::find<std::string>(general, "input");
+            {   // rotk row 275: general.arch = "r3000" selects the IOP (MIPS I) backend.
+                const std::string arch = toml::find_or<std::string>(general, "arch", "r5900");
+                config.arch = (arch == "r3000" || arch == "R3000" || arch == "iop") ? Arch::R3000 : Arch::R5900;
+                config.iopNamespace = toml::find_or<std::string>(general, "iop_namespace", "ps2x_iop_module");
+                config.iopRegisterSymbol = toml::find_or<std::string>(general, "iop_register", "ps2x_iop_register_module");
+            }
             config.ghidraMapPath = toml::find_or<std::string>(general, "ghidra_output", "");
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);

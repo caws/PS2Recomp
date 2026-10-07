@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "ps2recomp/control_flow_analyzer.h"
+#include "ps2recomp/types.h"
 
 namespace ps2recomp
 {
@@ -54,6 +55,16 @@ namespace ps2recomp
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
+        // rotk row 275: the R3000 (IOP module) backend.
+        void setArch(Arch arch, const std::string &iopNamespace, const std::string &iopRegisterSymbol)
+        {
+            m_arch = arch;
+            m_iopNamespace = iopNamespace;
+            m_iopRegisterSymbol = iopRegisterSymbol;
+        }
+        [[nodiscard]] Arch arch() const { return m_arch; }
+        [[nodiscard]] const std::string &iopNamespace() const { return m_iopNamespace; }
+        [[nodiscard]] const std::string &iopRegisterSymbol() const { return m_iopRegisterSymbol; }
         void setReporter(RecompilerReporter *reporter);
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
@@ -201,6 +212,11 @@ namespace ps2recomp
         const Symbol *findSymbolByAddress(uint32_t address) const;
         std::string getFunctionName(uint32_t address) const;
         std::string sanitizeFunctionName(const std::string& name) const;
+
+        // rotk row 275
+        Arch m_arch = Arch::R5900;
+        std::string m_iopNamespace;
+        std::string m_iopRegisterSymbol;
     };
 
 }

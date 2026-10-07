@@ -173,8 +173,20 @@ namespace ps2recomp
     };
 
     // Recompiler configuration
+    // rotk row 275: guest architecture. R5900 = the EE (default); R3000 = an IOP module (IRX, MIPS I), turned into a
+    // relocated ELF by ps2xIOP's ps2x_irx_image first. The R3000 output targets the IOP's native-module host instead of
+    // PS2Runtime (see ps2xRuntime/include/ps2x_iop_native.h).
+    enum class Arch
+    {
+        R5900,
+        R3000,
+    };
+
     struct RecompilerConfig
     {
+        Arch arch = Arch::R5900;
+        std::string iopNamespace;        // R3000: the C++ namespace the module's code is generated in
+        std::string iopRegisterSymbol;   // R3000: the extern "C" registration function for the module's functions
         std::string inputPath;
         std::string outputPath;
         std::string ghidraMapPath;

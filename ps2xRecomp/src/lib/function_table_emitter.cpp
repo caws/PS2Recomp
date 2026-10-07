@@ -146,6 +146,19 @@ namespace ps2recomp
         }
 
         std::stringstream ss;
+        // rotk row 275: an IOP module registers its functions (and resume entries) with the IOP native-module host when
+        // the module is loaded, instead of filling the EE's global table (whose addresses overlap the IOP's).
+        if (cg.arch() == Arch::R3000)
+        {
+            ss << "#include \"ps2x_iop_native.h\"\n";
+            ss << "#include \"" << cg.iopNamespace() << "_functions.h\"\n\n";
+            ss << "extern \"C\" void " << cg.iopRegisterSymbol() << "(::ps2x::iop::native::Registry &registry)\n{\n";
+            for (const auto &[address, name] : entries)
+                ss << "    registry.add(0x" << std::hex << address << "u, &" << cg.iopNamespace() << "::" << name << ");\n"
+                   << std::dec;
+            ss << "}\n";
+            return ss.str();
+        }
         ss << "#include \"ps2_runtime.h\"\n";
         ss << "#include <ps2_recompiled_functions.h>\n";
         ss << "#include \"ps2_stubs.h\"\n";
