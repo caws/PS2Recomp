@@ -763,18 +763,20 @@ bool PS2Runtime::sendIopSifCommand(uint32_t cid, const void *packet, uint32_t pa
 extern void ps2xBeginHostPump() noexcept;   // EeScheduler.cpp (engine patch 07)
 extern void ps2xEndHostPump() noexcept;
 
-uint32_t PS2Runtime::runPendingSifCommandHandlers(uint8_t *rdram, const R5900Context &ctx)
+uint32_t PS2Runtime::runPendingSifCommandHandlers(uint8_t *rdram)
 {
+    constexpr uint32_t kStackSize = 0x4000u;
+    if (m_sifHandlerStack == 0u)
+        m_sifHandlerStack = guestMalloc(kStackSize, 64u);
+    if (m_sifHandlerStack == 0u)
+        return 0u;
     uint32_t ran = 0u;
     GuestInvocation invocation;
     while (m_eeScheduler->takePendingInvocation(GuestInvocationKind::SifCommand, invocation))
     {
-        R5900Context call = ctx;
-        call.pc = invocation.context.pc;
-        for (int reg = 4; reg <= 7; ++reg)
-            call.r[reg] = invocation.context.r[reg];
-        // Below the interrupted code's live frame (an interrupt handler runs on the stack it interrupts).
-        const uint32_t sp = (static_cast<uint32_t>(_mm_cvtsi128_si32(ctx.r[29])) - 0x400u) & ~0xFu;
+        // The context the IOP host queued it with (the EE's registers, gp included; pc/a0/a1 = handler, packet, arg).
+        R5900Context call = invocation.context;
+        const uint32_t sp = (m_sifHandlerStack + kStackSize - 32u) & ~0xFu;
         call.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<int32_t>(sp)));
         call.r[31] = _mm_setzero_si128();
         ps2xBeginHostPump();

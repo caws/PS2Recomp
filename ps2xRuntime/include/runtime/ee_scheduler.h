@@ -367,6 +367,7 @@ public:
     void queueInvocation(GuestInvocation invocation);
     // rotk row 269: remove and return the oldest queued (not yet started) invocation of `kind`, if any.
     bool takePendingInvocation(GuestInvocationKind kind, GuestInvocation &out);
+    [[nodiscard]] bool hasPendingSifCommand() const noexcept { return m_pendingSifCommands != 0u; }
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
@@ -501,6 +502,8 @@ private:
     uint32_t m_gsVSyncCallbackGp = 0;
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
+    uint32_t m_pendingSifCommands = 0u;      // rotk row 269: queued GuestInvocationKind::SifCommand
+    bool m_deliveringSifCommands = false;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
     mutable std::mutex m_snapshotMutex;

@@ -325,10 +325,10 @@ public:
     bool sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
                            uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
     // rotk row 269: run the EE SIF command handlers the IOP has queued (GuestInvocationKind::SifCommand) NOW, to
-    // completion, on a copy of `ctx` below its stack pointer -- the SIF interrupt preempting the running code, as on
-    // hardware. For a hook whose guest chain waits on an IOP reply inside a host-pump scope, where the scheduler
-    // cannot deliver an invocation until the chain ends. Returns how many handlers ran.
-    uint32_t runPendingSifCommandHandlers(uint8_t *rdram, const R5900Context &ctx);
+    // completion, on a stack of their own -- the SIF interrupt preempting the running code, as on hardware. The
+    // scheduler calls it at checkpoints inside a host-pump scope, where it cannot deliver an invocation until the
+    // pumped chain ends. Returns how many handlers ran.
+    uint32_t runPendingSifCommandHandlers(uint8_t *rdram);
 
     using DebugUiCallback = void (*)(PS2Runtime &runtime, void *userData);
     void setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -523,6 +523,7 @@ private:
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
     std::atomic<bool> m_iopSifCommandForwarding{false};
+    uint32_t m_sifHandlerStack = 0u;   // rotk row 269: guest stack for runPendingSifCommandHandlers
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

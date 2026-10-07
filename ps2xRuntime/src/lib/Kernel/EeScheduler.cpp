@@ -367,6 +367,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
         m_events.clear();
         m_deadlines.clear();
         m_pendingInvocations.clear();
+        m_pendingSifCommands = 0u;
     }
     m_eventSequence = 0;
     m_invocationSequence = 0;
@@ -652,6 +653,8 @@ void EeScheduler::run()
                 GuestThread *owner = &acquireInvocationThread();
                 GuestInvocation invocation = std::move(m_pendingInvocations.front());
                 m_pendingInvocations.pop_front();
+                if (invocation.kind == GuestInvocationKind::SifCommand && m_pendingSifCommands)
+                    --m_pendingSifCommands;
                 owner->status = EeThreadStatus::Running;
                 m_currentThreadId = owner->id;
                 renewTimeSlice();
@@ -739,6 +742,8 @@ void EeScheduler::run()
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
+            if (invocation.kind == GuestInvocationKind::SifCommand && m_pendingSifCommands)
+                --m_pendingSifCommands;
             if (getRegU32(&invocation.context, 29) == 0u)
             {
                 SET_GPR_U32(&invocation.context, 29, invocationStackTop());
@@ -932,6 +937,17 @@ bool EeScheduler::checkpointDueSlow() noexcept
     if (s_hostPumpRtc && s_hostPumpDepth.load(std::memory_order_relaxed) != 0u &&
         !m_stopRequested.load(std::memory_order_acquire))
     {
+        // rotk row 269: a SIF command handler is an interrupt on hardware -- it preempts the running code, pumped
+        // chain or not. A guest chain that waits on an IOP reply inside a host pump (rotk: the level-load drain)
+        // would otherwise wait forever: the run loop cannot deliver an invocation until the chain ends. So deliver
+        // the queued SIF handlers here, at this block boundary. Only when the game forwards SIF commands to the
+        // emulated IOP (setIopSifCommandForwarding); nothing else queues SifCommand invocations.
+        if (m_pendingSifCommands != 0u && !m_deliveringSifCommands && m_runtime.iopSifCommandForwarding())
+        {
+            m_deliveringSifCommands = true;
+            (void)m_runtime.runPendingSifCommandHandlers(m_runtime.memory().getRDRAM());
+            m_deliveringSifCommands = false;
+        }
         return false;
     }
 
@@ -1738,6 +1754,8 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         }
     }
     invocation.sequence = ++m_invocationSequence;
+    if (invocation.kind == GuestInvocationKind::SifCommand)
+        ++m_pendingSifCommands;
     m_pendingInvocations.push_back(std::move(invocation));
     m_checkpointPending.store(true, std::memory_order_release);
 }
@@ -1751,6 +1769,8 @@ bool EeScheduler::takePendingInvocation(GuestInvocationKind kind, GuestInvocatio
         {
             out = std::move(*it);
             m_pendingInvocations.erase(it);
+            if (kind == GuestInvocationKind::SifCommand && m_pendingSifCommands)
+                --m_pendingSifCommands;
             return true;
         }
     }
