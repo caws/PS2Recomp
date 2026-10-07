@@ -1,4 +1,5 @@
 #include "iop_memory.h"
+#include "../spu2/ps2x_spu2.h"
 
 #include <algorithm>
 #include <cstring>
@@ -12,6 +13,11 @@ namespace ps2x::iop::detail
         constexpr uint32_t kDmaStart = 1u << 24u;
         constexpr int kDmaSpu0Irq = 0x24;
         constexpr int kDmaSpu1Irq = 0x28;
+        // IOP DMA 4 / 7 (PCSX2 IopHw.h: MADR +0, BCR +4, CHCR +8, TADR +0xC).
+        constexpr uint32_t kDmaSpu0Madr = 0x1F8010C0u, kDmaSpu0Bcr = 0x1F8010C4u, kDmaSpu0Tadr = 0x1F8010CCu;
+        constexpr uint32_t kDmaSpu1Madr = 0x1F801500u, kDmaSpu1Bcr = 0x1F801504u, kDmaSpu1Tadr = 0x1F80150Cu;
+        constexpr uint32_t kSpu2RegBase = 0x1F900000u, kSpu2RegEnd = 0x1F910000u;
+        bool isSpu2Register(uint32_t phys) { return phys >= kSpu2RegBase && phys < kSpu2RegEnd; }
 
         uint32_t alignUp(uint32_t value, uint32_t alignment)
         {
@@ -42,6 +48,8 @@ namespace ps2x::iop::detail
     uint8_t IopMemory::read8Slow(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Enabled && isSpu2Register(phys))
+            return static_cast<uint8_t>(ps2x::spu2::read16(phys & ~1u) >> ((phys & 1u) * 8u));
         if (phys < RamSize)
             return m_ram[phys];
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
@@ -53,6 +61,8 @@ namespace ps2x::iop::detail
     uint16_t IopMemory::read16Slow(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Enabled && isSpu2Register(phys) && (phys & 1u) == 0u)
+            return ps2x::spu2::read16(phys);
         if (phys + 1u < RamSize)
         {
             uint16_t value;
@@ -65,6 +75,8 @@ namespace ps2x::iop::detail
     uint32_t IopMemory::read32Slow(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Enabled && isSpu2Register(phys) && (phys & 3u) == 0u)   // PCSX2 psxHw4Read: two 16-bit reads
+            return ps2x::spu2::read16(phys) | (static_cast<uint32_t>(ps2x::spu2::read16(phys + 2u)) << 16u);
         if ((phys & 3u) == 0u && phys + 3u < RamSize)
         {
             uint32_t value;
@@ -89,6 +101,12 @@ namespace ps2x::iop::detail
     void IopMemory::write8Slow(uint32_t address, uint8_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Enabled && isSpu2Register(phys))
+        {
+            // 8-bit SPU2 writes: PCSX2 psxHw4Write8 forwards them as 16-bit writes of the byte.
+            ps2x::spu2::write16(phys & ~1u, value);
+            return;
+        }
         if (phys < RamSize)
         {
             m_ram[phys] = value;
@@ -110,6 +128,11 @@ namespace ps2x::iop::detail
     void IopMemory::write16Slow(uint32_t address, uint16_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Enabled && isSpu2Register(phys) && (phys & 1u) == 0u)
+        {
+            ps2x::spu2::write16(phys, value);
+            return;
+        }
         if (phys + 1u < RamSize)
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
@@ -123,6 +146,12 @@ namespace ps2x::iop::detail
     void IopMemory::write32Slow(uint32_t address, uint32_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (m_spu2Enabled && isSpu2Register(phys) && (phys & 3u) == 0u)   // PCSX2 psxHw4Write: two 16-bit writes
+        {
+            ps2x::spu2::write16(phys, static_cast<uint16_t>(value));
+            ps2x::spu2::write16(phys + 2u, static_cast<uint16_t>(value >> 16u));
+            return;
+        }
         if ((phys & 3u) == 0u && phys + 3u < RamSize)
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
@@ -208,6 +237,13 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        if (m_spu2Enabled)
+        {
+            if (address == kDmaSpu0Madr || address == kDmaSpu1Madr)
+                return ps2x::spu2::dmaMadr(address == kDmaSpu1Madr ? 1 : 0);
+            if (address == kDmaSpu0Tadr || address == kDmaSpu1Tadr)
+                return ps2x::spu2::dmaTadr(address == kDmaSpu1Tadr ? 1 : 0);
+        }
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
@@ -241,6 +277,29 @@ namespace ps2x::iop::detail
             break;
         }
 
+        if (m_spu2Enabled)
+        {
+            if (address == kDmaSpu0Madr || address == kDmaSpu1Madr)
+            {
+                ps2x::spu2::dmaMadr(address == kDmaSpu1Madr ? 1 : 0) = value;
+                return;
+            }
+            if (address == kDmaSpu0Tadr || address == kDmaSpu1Tadr)
+            {
+                ps2x::spu2::dmaTadr(address == kDmaSpu1Tadr ? 1 : 0) = value;
+                return;
+            }
+            if ((address == kDmaSpu0Chcr || address == kDmaSpu1Chcr) && (value & kDmaStart) != 0u)
+            {
+                // PCSX2 IopDma psxDma4/7: the transfer starts now, CHCR stays busy until the SPU2 core completes it.
+                m_hardware[address] = value;
+                const int core = address == kDmaSpu1Chcr ? 1 : 0;
+                const auto bcr = m_hardware.find(core ? kDmaSpu1Bcr : kDmaSpu0Bcr);
+                ps2x::spu2::dmaStart(core, ps2x::spu2::dmaMadr(core), bcr != m_hardware.end() ? bcr->second : 0u, value);
+                return;
+            }
+        }
+
         m_hardware[address] = value;
         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
             return;
@@ -268,6 +327,17 @@ namespace ps2x::iop::detail
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
             std::max<uint64_t>(transferWords * 2u, 64u),
         };
+    }
+
+    // PCSX2 IopDma spu2DMA4Irq/spu2DMA7Irq: clear the channel's busy bit and raise its DMA interrupt.
+    void IopMemory::spu2DmaComplete(int core)
+    {
+        const uint32_t chcr = core ? kDmaSpu1Chcr : kDmaSpu0Chcr;
+        auto current = m_hardware.find(chcr);
+        if (current == m_hardware.end() || (current->second & kDmaStart) == 0u)
+            return;
+        current->second &= ~kDmaStart;
+        m_dmaStart = DmaStart{core ? kDmaSpu1Irq : kDmaSpu0Irq, 0u};
     }
 
     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept

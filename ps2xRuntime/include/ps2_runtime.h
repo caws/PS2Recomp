@@ -16,6 +16,7 @@
 #include <smmintrin.h> // For SSE4.1 instructions
 #endif
 #include <atomic>
+#include <chrono>
 #include <array>
 #include <mutex>
 #include <filesystem>
@@ -321,6 +322,9 @@ public:
     // IOP services are HLE'd keeps today's behaviour (commands go nowhere); a game that runs its own IRX on the
     // emulated IOP turns it on (rotk: LOTR_IOP_LLE=1). sendIopSifCommand does nothing while it is off.
     void setIopSifCommandForwarding(bool enabled) noexcept { m_iopSifCommandForwarding = enabled; }
+    // rotk row 273: the emulated IOP's SPU2 (PCSX2's core) -- OFF by default; a game running its own sound driver IRX on
+    // the IOP turns it on (rotk: LOTR_IOP_LLE=1).
+    void setIopSpu2Enabled(bool enabled);
     [[nodiscard]] bool iopSifCommandForwarding() const noexcept { return m_iopSifCommandForwarding; }
     bool sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
                            uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);

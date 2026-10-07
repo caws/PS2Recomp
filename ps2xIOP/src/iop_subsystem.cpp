@@ -3,6 +3,7 @@
 #include "iop_service.h"
 #include "iop_module_manager.h"
 #include "emulator/iop_emulator.h"
+#include "emulator/spu2/ps2x_spu2.h"
 #include "module_factories.h"
 #include "ps2x/iop/ps2_path.h"
 
@@ -216,6 +217,16 @@ namespace ps2x::iop
     uint32_t IopSubsystem::iopSoftwareRegister(uint32_t index) const noexcept
     {
         return m_impl->emulator.softwareRegister(index);
+    }
+
+    void IopSubsystem::setSpu2Enabled(bool enabled)
+    {
+        m_impl->emulator.setSpu2Enabled(enabled);
+    }
+
+    size_t IopSubsystem::takeSpu2Samples(int16_t *destination, size_t maxFrames)
+    {
+        return ps2x::spu2::takeSamples(destination, maxFrames);
     }
 
     void IopSubsystem::onSifTransfer(const SifTransfer &transfer)

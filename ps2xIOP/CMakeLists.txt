@@ -32,6 +32,27 @@ add_library(ps2_iop STATIC
 
 target_compile_features(ps2_iop PUBLIC cxx_std_20)
 
+# ---- rotk row 273: PCSX2's SPU2 core (GPL-3.0+, see src/emulator/spu2/README.md) ------------------------------------
+# Its own library so the PCSX2 shims (common/, GS/, Config.h, ...) and the force-included prelude stay out of ps2_iop.
+add_library(ps2x_spu2 STATIC
+    src/emulator/spu2/ps2x_spu2.cpp
+    src/emulator/spu2/pcsx2/SPU2/ADSR.cpp
+    src/emulator/spu2/pcsx2/SPU2/Dma.cpp
+    src/emulator/spu2/pcsx2/SPU2/Mixer.cpp
+    src/emulator/spu2/pcsx2/SPU2/ReadInput.cpp
+    src/emulator/spu2/pcsx2/SPU2/RegTable.cpp
+    src/emulator/spu2/pcsx2/SPU2/Reverb.cpp
+    src/emulator/spu2/pcsx2/SPU2/ReverbResample.cpp
+    src/emulator/spu2/pcsx2/SPU2/spu2sys.cpp
+)
+target_compile_features(ps2x_spu2 PUBLIC cxx_std_20)
+target_include_directories(ps2x_spu2 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/spu2/shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/spu2/pcsx2)
+target_compile_options(ps2x_spu2 PRIVATE
+    -include ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/spu2/shim/ps2x_spu2_prelude.h -w)
+target_link_libraries(ps2_iop PRIVATE ps2x_spu2)
+
 target_include_directories(ps2_iop
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

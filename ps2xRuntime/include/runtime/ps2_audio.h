@@ -1,7 +1,9 @@
 #ifndef PS2_AUDIO_H
 #define PS2_AUDIO_H
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -64,6 +66,15 @@ public:
     void     streamStop(uint32_t key);
     void     streamStopAll();
 
+    // --- rotk row 273: the emulated IOP's SPU2 output ------------------------------------------------------------
+    // One 48 kHz stereo s16 stream fed by `source(destination, maxFrames) -> frames` (the SPU2 mix ring). While it
+    // is open the HLE's own playback (play(), streamOpen()) stands down: the game's real sound driver drives the
+    // speakers, and the HLE must not double it. No-op without a host audio device.
+    bool spu2OutputOpen(std::function<size_t(int16_t *, size_t)> source);
+    void spu2OutputClose();
+    [[nodiscard]] bool spu2OutputActive() const { return m_spu2Output; }
+    [[nodiscard]] uint64_t spu2UnderrunFrames() const;
+
 private:
     struct DecodedSample
     {
@@ -74,6 +85,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
     bool m_audioReady = false;
+    bool m_spu2Output = false;
     uint32_t m_mostRecentSampleKey = 0;
     std::vector<DecodedSample> m_loadOrderSamples;
     std::vector<uint32_t> m_loadOrderSampleKeys;

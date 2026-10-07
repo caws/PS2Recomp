@@ -16,6 +16,7 @@
 #include "imports/iop_timrman.h"
 #include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
+#include "spu2/ps2x_spu2.h"
 
 #include <algorithm>
 #include <chrono>
@@ -43,6 +44,8 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        constexpr int kSpu2Irq = 9;   // PCSX2 IopIrq.cpp spu2Irq: iopIntcIrq(9)
+        constexpr uint64_t kSpu2TickCycles = 768u;   // PCSX2 IopCounters: counter 6 (the SPU2) rate, one 48 kHz sample
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -69,7 +72,7 @@ namespace ps2x::iop::detail
 
     }
 
-    class IopEmulator::Impl final : public IopGuestExecutor
+    class IopEmulator::Impl final : public IopGuestExecutor, public ps2x::spu2::Host
     {
     public:
         using CpuState = IopCpuState;
@@ -145,6 +148,35 @@ namespace ps2x::iop::detail
             secrMcCommandHandler = {};
             secrMcDevIdHandler = {};
             checkKelfPathCallback = {};
+        }
+
+        // ---- rotk row 273: the SPU2 core's view of this IOP (ps2x::spu2::Host) --------------------------------------
+        uint8_t *iopRam() override
+        {
+            return const_cast<uint8_t *>(memory.ram().data());
+        }
+
+        void spu2Interrupt() override
+        {
+            pendingDmaInterrupts[kSpu2Irq] = totalCycles;   // IRQ 9, serviced like the DMA ones (never nested)
+        }
+
+        void spu2DmaComplete(int core) override
+        {
+            memory.spu2DmaComplete(core);
+            schedulePendingDma();
+        }
+
+        void setSpu2Enabled(bool enabled)
+        {
+            if (enabled == memory.spu2Enabled())
+                return;
+            if (enabled)
+            {
+                ps2x::spu2::attach(this);
+                ps2x::spu2::reset(totalCycles);
+            }
+            memory.setSpu2Enabled(enabled);
         }
 
         uint8_t read8(uint32_t address) const
@@ -436,6 +468,8 @@ namespace ps2x::iop::detail
             static const int s_pcProf = [] { const char *e = std::getenv("PS2X_IOP_PCPROF"); return e ? std::atoi(e) : 0; }();
             if (s_pcProf > 0)
                 profilePc(cpu.pc, s_pcProf);
+            if (memory.spu2Enabled())
+                ps2x::spu2::setCycle(totalCycles);   // PCSX2 psxRegs.cycle: SPU2 register accesses mix up to "now"
             const bool running = cpuCore.executeInstruction(cpu);
             schedulePendingDma();
             ++totalInstructions;
@@ -460,6 +494,23 @@ namespace ps2x::iop::detail
             for (uint32_t i = 0; i < s_hist.size(); ++i)
                 if (s_hist[i]) { top.emplace_back(s_hist[i], i * 4u); total += s_hist[i]; }
             std::sort(top.begin(), top.end(), std::greater<>());
+            // PS2X_IOP_PCPROF_FILE=<path>: also write the whole histogram (pc count module offset), for aggregating by symbol.
+            if (const char *path = std::getenv("PS2X_IOP_PCPROF_FILE"); path && *path)
+            {
+                if (FILE *f = std::fopen(path, "w"))
+                {
+                    for (const auto &[count, pcAddress] : top)
+                    {
+                        const Module *owner = nullptr;
+                        for (const auto &[id, module] : modules)
+                            if (pcAddress >= module.base && pcAddress < module.base + module.size)
+                                owner = &module;
+                        std::fprintf(f, "%08x %u %s %x\n", pcAddress, count, owner ? owner->name.c_str() : "?",
+                                     owner ? pcAddress - owner->base : pcAddress);
+                    }
+                    std::fclose(f);
+                }
+            }
             std::fprintf(stderr, "[iop:pcprof] %llu instructions; top pcs:\n", static_cast<unsigned long long>(total));
             for (size_t i = 0; i < top.size() && i < 40u; ++i)
             {
@@ -488,6 +539,14 @@ namespace ps2x::iop::detail
                     servicePendingGuestCallbacks();
                 if (rpc.hasPendingEeCommands())
                     rpc.serviceEeCommands(*this);
+                // The SPU2 runs on IOP time inside ANY guest execution, synchronous calls (module start, RPC) included:
+                // a driver waiting for an SPU DMA to finish inside its start routine must see it finish.
+                if (memory.spu2Enabled() && totalCycles - spu2LastAdvance >= kSpu2TickCycles)
+                {
+                    spu2LastAdvance = totalCycles;
+                    ps2x::spu2::advance(totalCycles);
+                    schedulePendingDma();
+                }
             }
             activeCpu = previous;
             return static_cast<uint32_t>(totalInstructions - start);
@@ -668,6 +727,8 @@ namespace ps2x::iop::detail
                     servicePendingGuestCallbacks();
                     if (rpc.hasPendingEeCommands())
                         rpc.serviceEeCommands(*this);
+                    if (memory.spu2Enabled())
+                        ps2x::spu2::advance(totalCycles);   // PCSX2 SPU2async (counter 6): mix up to now
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
@@ -813,6 +874,7 @@ namespace ps2x::iop::detail
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
+        uint64_t spu2LastAdvance = 0u;
         GuestCallback secrMcCommandHandler;
         GuestCallback secrMcDevIdHandler;
         GuestCallback checkKelfPathCallback;
@@ -863,6 +925,11 @@ namespace ps2x::iop::detail
                                       uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize)
     {
         return m_impl->rpc.queueEeCommand(cid, packet, packetSize, eeExtraSource, iopExtraDestination, extraSize);
+    }
+
+    void IopEmulator::setSpu2Enabled(bool enabled)
+    {
+        m_impl->setSpu2Enabled(enabled);
     }
 
     uint32_t IopEmulator::softwareRegister(uint32_t index) const noexcept

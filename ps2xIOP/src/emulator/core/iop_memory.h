@@ -133,6 +133,13 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
+
+        // rotk row 273: route the SPU2 register range and IOP DMA 4/7 to the SPU2 core (ps2x::spu2). OFF by default:
+        // upstream's register store + fixed-delay SPU DMA completion. A started SPU DMA stays busy until the core
+        // reports it done (spu2DmaComplete).
+        void setSpu2Enabled(bool enabled) noexcept { m_spu2Enabled = enabled; }
+        [[nodiscard]] bool spu2Enabled() const noexcept { return m_spu2Enabled; }
+        void spu2DmaComplete(int core);
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static constexpr uint32_t physicalAddress(uint32_t address) noexcept { return address & 0x1FFFFFFFu; }
@@ -158,5 +165,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        bool m_spu2Enabled = false;
     };
 }

@@ -751,6 +751,23 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
+void PS2Runtime::setIopSpu2Enabled(bool enabled)
+{
+    if (!m_iopSubsystem)
+        return;
+    m_iopSubsystem->setSpu2Enabled(enabled);
+    if (enabled)
+    {
+        ps2x::iop::IopSubsystem *iop = m_iopSubsystem.get();
+        (void)m_audioBackend.spu2OutputOpen([iop](int16_t *destination, size_t frames)
+                                            { return iop->takeSpu2Samples(destination, frames); });
+    }
+    else
+    {
+        m_audioBackend.spu2OutputClose();
+    }
+}
+
 bool PS2Runtime::sendIopSifCommand(uint32_t cid, const void *packet, uint32_t packetSize,
                                    uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize)
 {

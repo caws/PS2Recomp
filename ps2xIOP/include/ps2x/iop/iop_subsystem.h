@@ -39,6 +39,10 @@ namespace ps2x::iop
                             uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
         // The IOP's sifcmd software register `index` (0..31), as sceSifGetSreg on the IOP would read it.
         [[nodiscard]] uint32_t iopSoftwareRegister(uint32_t index) const noexcept;
+        // rotk row 273: emulate the SPU2 (PCSX2's core) behind the IOP's sound registers and DMA 4/7. OFF by default.
+        void setSpu2Enabled(bool enabled);
+        // The SPU2's mixed output (48 kHz interleaved stereo s16), oldest first; returns frames copied.
+        size_t takeSpu2Samples(int16_t *destination, size_t maxFrames);
 
         // Physical IOP RAM access shared by the emulator, SIF DMA, and HLE services. Addresses are IOP addresses.
         [[nodiscard]] uint32_t allocateMemory(uint32_t size, uint32_t alignment = 16u);

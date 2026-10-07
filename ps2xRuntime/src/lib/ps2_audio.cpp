@@ -258,6 +258,8 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
 void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint32_t voiceIndex,
                            float pan)
 {
+    if (m_spu2Output)
+        return; // rotk row 273: the SPU2 drives the speakers
     std::lock_guard<std::mutex> lock(m_mutex);
     DecodedSample *sampleToPlay = nullptr;
     uint32_t sampleKey = 0;
@@ -315,6 +317,8 @@ void PS2AudioBackend::pruneFinishedSounds()
 void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sample, float pitch, float volume,
                                         bool isBgm, float pan)
 {
+    if (m_spu2Output)
+        return; // rotk row 273: the SPU2 drives the speakers
 #if defined(PLATFORM_VITA)
     (void)sampleKey;
     (void)sample;
@@ -678,6 +682,8 @@ bool PS2AudioBackend::streamOpen(uint32_t key, uint32_t sampleRate, float volume
 #else
     if (!m_audioReady)
         return false; // PS2X_AUDIO unset: no host device, so stay silent rather than buffer
+    if (m_spu2Output)
+        return false; // rotk row 273: the SPU2 drives the speakers
     if (sampleRate < 1000u || sampleRate > 96000u)
         return false;
     if (channels < 1u || channels > 2u)
@@ -875,4 +881,76 @@ void PS2AudioBackend::streamStopAll()
         if (g_streams[i].active.load(std::memory_order_acquire))
             streamStop(g_streams[i].key);
     }
+}
+
+// ---- rotk row 273: the SPU2 output stream ---------------------------------------------------------------------------
+namespace
+{
+    std::function<size_t(int16_t *, size_t)> g_spu2Source;
+    std::atomic<uint64_t> g_spu2Underrun{0};
+    AudioStream g_spu2Stream{};
+
+    // raylib's audio thread: take what the SPU2 has mixed, pad the rest with silence (an underrun: the emulation ran
+    // behind real time).
+    void spu2StreamCallback(void *buffer, unsigned int frames)
+    {
+        int16_t *out = static_cast<int16_t *>(buffer);
+        const size_t got = g_spu2Source ? g_spu2Source(out, frames) : 0u;
+        if (got < frames)
+        {
+            std::memset(out + got * 2u, 0, (frames - got) * 2u * sizeof(int16_t));
+            g_spu2Underrun.fetch_add(frames - got, std::memory_order_relaxed);
+        }
+        // PS2X_SPU2_LOG=1: every ~5 s of playback, how much of it was silence padding (the emulation behind real time).
+        static const bool s_log = [] { const char *e = std::getenv("PS2X_SPU2_LOG"); return e && e[0] == '1'; }();
+        static uint64_t s_played = 0u, s_lastUnder = 0u;
+        if (s_log && (s_played += frames) >= 240000u)
+        {
+            const uint64_t under = g_spu2Underrun.load(std::memory_order_relaxed);
+            std::fprintf(stderr, "[audio:spu2] last %.1f s: %.1f%% underrun\n", s_played / 48000.0,
+                         100.0 * double(under - s_lastUnder) / double(s_played));
+            s_played = 0u;
+            s_lastUnder = under;
+        }
+    }
+}
+
+bool PS2AudioBackend::spu2OutputOpen(std::function<size_t(int16_t *, size_t)> source)
+{
+#if defined(PLATFORM_VITA)
+    (void)source;
+    return false;
+#else
+    if (!m_audioReady || m_spu2Output)
+        return m_spu2Output;
+    streamStopAll();
+    stopAll();
+    g_spu2Source = std::move(source);
+    g_spu2Stream = LoadAudioStream(48000, 16, 2);
+    if (!IsAudioStreamValid(g_spu2Stream))
+        return false;
+    SetAudioStreamCallback(g_spu2Stream, spu2StreamCallback);
+    PlayAudioStream(g_spu2Stream);
+    m_spu2Output = true;
+    std::fprintf(stderr, "[audio] SPU2 output open (48000 Hz stereo); HLE playback stands down\n");
+    return true;
+#endif
+}
+
+void PS2AudioBackend::spu2OutputClose()
+{
+#if !defined(PLATFORM_VITA)
+    if (!m_spu2Output)
+        return;
+    StopAudioStream(g_spu2Stream);
+    SetAudioStreamCallback(g_spu2Stream, nullptr);
+    UnloadAudioStream(g_spu2Stream);
+    g_spu2Source = nullptr;
+    m_spu2Output = false;
+#endif
+}
+
+uint64_t PS2AudioBackend::spu2UnderrunFrames() const
+{
+    return g_spu2Underrun.load(std::memory_order_relaxed);
 }
