@@ -2589,6 +2589,30 @@ uint32_t PS2Runtime::guestHeapLimit() const
     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
 }
 
+PS2Runtime::GuestHeapState PS2Runtime::saveGuestHeapState() const
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    GuestHeapState state;
+    state.blocks = m_guestHeapBlocks;
+    state.base = m_guestHeapBase;
+    state.end = m_guestHeapEnd;
+    state.limit = m_guestHeapLimit;
+    state.suggestedBase = m_guestHeapSuggestedBase;
+    state.configured = m_guestHeapConfigured;
+    return state;
+}
+
+void PS2Runtime::restoreGuestHeapState(const GuestHeapState &state)
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    m_guestHeapBlocks = state.blocks;
+    m_guestHeapBase = state.base;
+    m_guestHeapEnd = state.end;
+    m_guestHeapLimit = state.limit;
+    m_guestHeapSuggestedBase = state.suggestedBase;
+    m_guestHeapConfigured = state.configured;
+}
+
 uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)
 {
     if (size == 0u)

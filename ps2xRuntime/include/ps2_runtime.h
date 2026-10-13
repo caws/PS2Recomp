@@ -502,6 +502,21 @@ private:
         bool free = true;
     };
 
+public:
+    // The HLE guest heap's host-side bookkeeping (block list, bounds), as an opaque value. A caller that rewinds
+    // guest RAM to re-run guest code (the game's decompilation shadow check) must rewind this too, or a malloc in
+    // the re-run returns a different block than the first run did.
+    class GuestHeapState
+    {
+        friend class PS2Runtime;
+        std::vector<GuestHeapBlock> blocks;
+        uint32_t base = 0, end = 0, limit = 0, suggestedBase = 0;
+        bool configured = false;
+    };
+    GuestHeapState saveGuestHeapState() const;
+    void restoreGuestHeapState(const GuestHeapState &state);
+
+private:
     static uint32_t alignGuestHeapValue(uint32_t value, uint32_t alignment);
     static bool isGuestHeapAlignmentValid(uint32_t alignment);
     static uint32_t normalizeGuestHeapAlignment(uint32_t alignment);
