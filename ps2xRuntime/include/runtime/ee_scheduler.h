@@ -308,6 +308,9 @@ public:
     {
         return m_checkpointEpoch.load(std::memory_order_acquire);
     }
+    // Row 277: the EE cycle clock, read-only (for a caller that must compare the cycles two runs of the same guest
+    // code charge, e.g. a game repo's lifted-function oracle). EE thread only, like accountCycles.
+    [[nodiscard]] uint64_t eeCycleNow() const noexcept { return m_eeCycle; }
     inline void accountCycles(uint32_t cycles) noexcept
     {
         const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
