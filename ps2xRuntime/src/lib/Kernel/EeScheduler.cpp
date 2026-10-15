@@ -1007,7 +1007,11 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // EE priorities are 0..127 and 0 is valid: SetupThread gives the main thread priority 0, and games create
+    // threads at the main thread's priority (CRI ADXM_SetupThrd reads it with ReferThreadStatus -- Auto
+    // Modellista got -403 for every ADX thread and slept forever). The pre-f4309cd Thread.cpp rejected only
+    // >= 128; Play! Source/ee/PS2OS.cpp sc_CreateThread asserts initPriority < 128 (PCSX2 runs the real BIOS).
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -1285,7 +1289,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount)   // 0..127, as CreateThread (see there)
     {
         return KE_ILLEGAL_PRIORITY;
     }
