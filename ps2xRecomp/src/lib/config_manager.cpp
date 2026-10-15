@@ -80,6 +80,15 @@ namespace ps2recomp
                 config.stubImplementations = toml::find<std::vector<std::string>>(data, "stubs");
             }
 
+            if (general.contains("recompile") && general.at("recompile").is_array())
+            {
+                config.recompileFunctions = toml::find<std::vector<std::string>>(general, "recompile");
+            }
+            else if (data.contains("recompile") && data.at("recompile").is_array())
+            {
+                config.recompileFunctions = toml::find<std::vector<std::string>>(data, "recompile");
+            }
+
             auto appendEntryPointHints = [&](const toml::value &table, const char *key)
             {
                 if (!table.contains(key) || !table.at(key).is_array())

@@ -857,6 +857,8 @@ namespace ps2recomp
             m_skipFunctionStarts.clear();
             m_stubFunctions.clear();
             m_stubFunctionStarts.clear();
+            m_recompileFunctions.clear();
+            m_recompileFunctionStarts.clear();
             m_stubHandlerBindingsByStart.clear();
             m_entryPointHintStarts.clear();
             m_correctnessCriticalFunctionStarts.clear();
@@ -872,6 +874,14 @@ namespace ps2recomp
                 {
                     m_skipFunctionStarts.insert(*selector.start);
                 }
+            }
+            for (const auto &name : m_config.recompileFunctions)
+            {
+                const FunctionSelector selector = parseFunctionSelector(name);
+                if (selector.start.has_value())
+                    m_recompileFunctionStarts.insert(*selector.start);
+                else if (!selector.name.empty())
+                    m_recompileFunctions.insert(selector.name);
             }
             for (const auto &name : m_config.stubImplementations)
             {
@@ -1009,11 +1019,19 @@ namespace ps2recomp
             m_decoder = std::make_unique<R5900Decoder>();
             m_codeGenerator = std::make_unique<CodeGenerator>(m_symbols, m_sections);
             m_codeGenerator->setReporter(&m_reporter);
+            // config `recompile`: a call whose relocation names an exempted function must reach its recompiled body,
+            // not be emitted as a direct runtime-stub call by name (emitRelocationCallIfAvailable).
+            std::unordered_set<std::string> recompileNames = m_recompileFunctions;
+            for (const auto &symbol : m_symbols)
+            {
+                if (symbol.isFunction && m_recompileFunctionStarts.contains(symbol.address))
+                    recompileNames.insert(symbol.name);
+            }
             std::unordered_map<uint32_t, std::string> relocationCallNames;
             relocationCallNames.reserve(m_relocations.size());
             for (const auto &reloc : m_relocations)
             {
-                if (reloc.symbolName.empty())
+                if (reloc.symbolName.empty() || recompileNames.contains(reloc.symbolName))
                 {
                     continue;
                 }
@@ -2268,6 +2286,12 @@ namespace ps2recomp
         if (m_stubFunctions.contains(function.name))
         {
             return true;
+        }
+        // config `recompile`: keep the binary's own body even though the name matches a runtime handler.
+        if (m_recompileFunctionStarts.contains(function.start) ||
+            (!function.name.empty() && m_recompileFunctions.contains(function.name)))
+        {
+            return false;
         }
         return ps2_runtime_calls::isStubName(function.name);
     }

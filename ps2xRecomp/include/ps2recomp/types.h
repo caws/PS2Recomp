@@ -199,6 +199,10 @@ namespace ps2recomp
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
+        // `recompile`: functions recompiled from the binary even though their name matches a runtime stub handler
+        // (isStubFunction otherwise stubs every function named like one -- with a symbolised ELF that includes
+        // handlers that are only TODO aborts). Same "name@0xADDR" selectors as `stubs`; an explicit stub still wins.
+        std::vector<std::string> recompileFunctions;
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
