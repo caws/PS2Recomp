@@ -417,20 +417,22 @@ namespace ps2_stubs
                 return kMcResultUpLimitHandle;
             }
 
-            for (int attempt = 0; attempt < 0x10000; ++attempt)
+            // amo_recomp row 290: the LOWEST free descriptor, from 0, as MCMAN hands them out (ps2sdk
+            // iop/memorycard/mcman/src/ps2mc_fio.c mcman_open2: `fd = 0; do { if (fh->status == 0) break; }
+            // while (++fd < MAX_FDHANDLES)`). This was a counter from 1 (1, 2, 3, ...). Auto Modellista's
+            // ps2mc_flMDSaveData writes its main data file through the fd variable only its icon branches store
+            // (-0x48AC(gp)); on a console every lone open gets fd 0, so that works, but here the write went to an
+            // already-closed descriptor and the save was a 0-byte BESLES-51191SYS that every later boot failed
+            // to load.
+            for (int32_t fd = 0; fd < static_cast<int32_t>(kMcMaxOpenFiles); ++fd)
             {
-                if (g_mcNextFd <= 0)
-                {
-                    g_mcNextFd = 1;
-                }
-
-                const int32_t fd = g_mcNextFd++;
                 if (g_mcFiles.find(fd) != g_mcFiles.end())
                 {
                     continue;
                 }
 
                 g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath});
+                g_mcNextFd = fd + 1;
                 return fd;
             }
 
