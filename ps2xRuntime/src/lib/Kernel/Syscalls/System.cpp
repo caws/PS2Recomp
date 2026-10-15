@@ -598,6 +598,15 @@ namespace ps2_syscalls
         setReturnS32(ctx, -1);
     }
 
+    // Bottom of the main thread's stack, recorded by SetupThread for SetupHeap(-1) (0 = unknown).
+    static uint32_t g_mainStackBottom = 0u;
+
+    // EE kernel SetupThread reserves one saved thread context (0x2A0 bytes) below the stack top and
+    // places a stack=-1 stack at the top of RAM minus 4 KB (Play! Source/ee/PS2OS.cpp sc_SetupThread,
+    // STACKRES = 0x2A0 in PS2OS.h; PCSX2 runs the real BIOS and has no HLE equivalent).
+    static constexpr uint32_t kKernelStackReserve = 0x2A0u;
+    static constexpr uint32_t kKernelTopOfRamReserve = 0x1000u;
+
     // 0x3C SetupThread
     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -619,35 +628,27 @@ namespace ps2_syscalls
         const uint32_t stackSize = stackSizeSigned > 0
                                        ? static_cast<uint32_t>(stackSizeSigned)
                                        : 0u;
+        // stack=-1: the stack's TOP is the end of RAM (less the kernel's 4 KB); stack_size counts down
+        // from it. (This used to put the TOP at RAM_SIZE - stack_size, one stack lower than hardware,
+        // to leave the top of RAM to the async callback stacks, now in kernel RAM.)
+        uint32_t stackTop = 0u;
         if (stack == 0xFFFFFFFFu)
         {
-            if (stackSizeSigned > 0)
-            {
-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
-                if (requestedSize < PS2_RAM_SIZE)
-                {
-                    sp = PS2_RAM_SIZE - requestedSize;
-                }
-                else
-                {
-                    sp = PS2_RAM_SIZE;
-                }
-            }
-            else
-            {
-                sp = PS2_RAM_SIZE;
-            }
+            stackTop = PS2_RAM_SIZE - kKernelTopOfRamReserve;
+            g_mainStackBottom = (stackSize > 0u && stackSize < stackTop) ? stackTop - stackSize : 0u;
         }
         else if (stack != 0u)
         {
-            if (stackSizeSigned > 0)
-            {
-                sp = stack + static_cast<uint32_t>(stackSizeSigned);
-            }
-            else
-            {
-                sp = stack;
-            }
+            stackTop = stack + stackSize;
+            g_mainStackBottom = stack;
+        }
+        else
+        {
+            g_mainStackBottom = 0u;
+        }
+        if (stackTop != 0u)
+        {
+            sp = stackTop - kKernelStackReserve;
         }
 
         sp &= ~0xFu;
@@ -677,10 +678,16 @@ namespace ps2_syscalls
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
-        if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
+        // size -1 = "up to the main thread's stack" (Play! PS2OS.cpp sc_SetupHeap: heap end = the
+        // current thread's stackBase). Fall back to the default end when no stack was set up.
+        if (heapSize == 0xFFFFFFFFu && g_mainStackBottom > heapBase)
+        {
+            heapLimit = g_mainStackBottom;
+        }
+        else if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
         {
             const uint64_t candidate = static_cast<uint64_t>(heapBase) + static_cast<uint64_t>(heapSize);
-            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, kDefaultGuestHeapEnd));
+            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, PS2_RAM_SIZE));
         }
 
         if (heapLimit <= heapBase)

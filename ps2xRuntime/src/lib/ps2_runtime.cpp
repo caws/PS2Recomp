@@ -162,7 +162,15 @@ namespace
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // Heap limit until the game calls SetupHeap (and the fallback when the main stack is unknown).
+    // SetupHeap(-1) may raise it up to the main thread's stack bottom, as the EE kernel does.
+    constexpr uint32_t kGuestHeapDefaultLimit = 0x01F00000u;
+    constexpr uint32_t kGuestHeapHardLimit = PS2_RAM_SIZE;
+    // Async callback (interrupt-handler / invocation) stacks: EE kernel RAM, which on hardware holds the
+    // kernel's own handler stacks, so they can never overlap the game's heap or main stack. 11 x 16 KB.
+    // They used to grow down from 0x02000000 with a 0x01F00000 floor, through the main stack.
+    constexpr uint32_t kAsyncCallbackStackFloor = 0x00052000u;
+    constexpr uint32_t kAsyncCallbackStackTop = 0x00080000u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -646,11 +654,11 @@ PS2Runtime::PS2Runtime()
     m_guestHeapBlocks.clear();
     m_guestHeapBase = kGuestHeapDefaultBase;
     m_guestHeapEnd = kGuestHeapDefaultBase;
-    m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+    m_guestHeapLimit = kGuestHeapDefaultLimit;
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = kAsyncCallbackStackFloor;
+    m_asyncCallbackStackTop = kAsyncCallbackStackTop;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -1256,18 +1264,22 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_guestHeapMutex);
         if (!m_guestHeapConfigured)
         {
-            const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-            m_guestHeapSuggestedBase = std::min(suggestedHeapBase, hardLimit);
+            m_guestHeapSuggestedBase = std::min(suggestedHeapBase, kGuestHeapDefaultLimit);
             m_guestHeapBase = m_guestHeapSuggestedBase;
             m_guestHeapEnd = m_guestHeapSuggestedBase;
-            m_guestHeapLimit = hardLimit;
+            m_guestHeapLimit = kGuestHeapDefaultLimit;
         }
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = kAsyncCallbackStackFloor;
+        m_asyncCallbackStackTop = kAsyncCallbackStackTop;
+        if (moduleBase < kAsyncCallbackStackTop)
+        {
+            std::cerr << "[guest-ram] WARNING: ELF loads at 0x" << std::hex << moduleBase
+                      << ", inside the runtime's kernel-RAM area (below 0x" << kAsyncCallbackStackTop
+                      << ")" << std::dec << std::endl;
+        }
     }
 
     LoadedModule module;
@@ -2243,7 +2255,11 @@ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
 uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
 {
     const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    if (guestLimit == 0u || guestLimit > hardLimit)
+    if (guestLimit == 0u)
+    {
+        return kGuestHeapDefaultLimit;
+    }
+    if (guestLimit > hardLimit)
     {
         return hardLimit;
     }
