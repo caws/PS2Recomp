@@ -17482,6 +17482,62 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     if (!valid1 && !valid2)
         return result;
 
+    bool deferPresentSave = false;
+    auto savePresented = [&](const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, const GSFrameReg &selected)
+    {
+    // Present-output save (PS2X_GS_PRESENT_SAVE=<dir>): every 512th present, save the
+    // EXACT pixels handed to the viewer (rotating 4 slots) — separates "presentation reads
+    // wrong" from "viewer blit wrong".
+    {
+        static unsigned long s_presN = 0;
+        ++s_presN;
+        const char *pd = std::getenv("PS2X_GS_PRESENT_SAVE");
+        // cont.230: PS2X_GS_PRESENT_SAVE_EVERY (default 32) / PS2X_GS_PRESENT_SAVE_SLOTS (default
+        // 16) make the rotation cover a whole level-era walk instead of its last ~13 s.
+        static const unsigned long s_presEvery = []
+        { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_EVERY"); unsigned long v = e ? std::strtoul(e, nullptr, 10) : 32ul; return v ? v : 32ul; }();
+        static const unsigned long s_presSlots = []
+        { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_SLOTS"); unsigned long v = e ? std::strtoul(e, nullptr, 10) : 16ul; return v ? v : 16ul; }();
+        // ★ cont.329 phase 4c: PS2X_GS_PRESENT_SAVE_BYFLIP=<n> names the file by the guest
+        // DISPLAY FLIP count instead of by a rotating presentation slot. Presentation is
+        // host-paced, so two renderers running at different speeds save different MOMENTS and
+        // a side-by-side compares nothing -- which defeated two attempts at exactly that
+        // comparison. The flip counter is guest-driven and, under deterministic replay,
+        // identical across runs, so flip K is the same instant in both.
+        static const unsigned long s_presByFlip = []
+        { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_BYFLIP"); return e ? std::strtoul(e, nullptr, 10) : 0ul; }();
+        static unsigned long s_lastSavedFlip = ~0ul;
+        const unsigned long s_flipNow = static_cast<unsigned long>(g_perfFlips.load());
+        const bool saveByFlip = pd && s_presByFlip && !pixels.empty() &&
+                                (s_flipNow % s_presByFlip) == 0ul && s_flipNow != s_lastSavedFlip;
+        if (saveByFlip)
+            s_lastSavedFlip = s_flipNow;
+        if (saveByFlip || (pd && !s_presByFlip && g_gs2EraOpen &&
+                           (s_presN % s_presEvery) == 0u && !pixels.empty()))
+        {
+            char path[512];
+            if (saveByFlip)
+                std::snprintf(path, sizeof(path), "%s/flip_%06lu.ppm", pd, s_flipNow);
+            else
+                std::snprintf(path, sizeof(path), "%s/present_%02lu.ppm", pd, (s_presN / s_presEvery) % s_presSlots);
+            if (FILE *f = std::fopen(path, "wb"))
+            {
+                std::fprintf(f, "P6\n%u %u\n255\n", width, height);
+                for (uint32_t yy = 0; yy < height; ++yy)
+                    for (uint32_t xx = 0; xx < width; ++xx)
+                    {
+                        const uint8_t *pp = pixels.data() + (yy * kHostFrameWidth + xx) * 4u;
+                        std::fputc(pp[0], f);
+                        std::fputc(pp[1], f);
+                        std::fputc(pp[2], f);
+                    }
+                std::fclose(f);
+                std::fprintf(stderr, "[gs2:present-save] %s src fbp=%u fbw=%u psm=0x%x %ux%u\n",
+                             path, selected.fbp, selected.fbw, selected.psm, width, height);
+            }
+        }
+    }
+    };
     auto copySource = [&](const GSFrameReg &displayFrame,
                           const GSDisplayReadOrigin &origin,
                           uint32_t width,
@@ -17528,58 +17584,11 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                 }
             }
         }
-        // Present-output save (PS2X_GS_PRESENT_SAVE=<dir>): every 512th present, save the
-        // EXACT pixels handed to the viewer (rotating 4 slots) — separates "presentation reads
-        // wrong" from "viewer blit wrong".
-        {
-            static unsigned long s_presN = 0;
-            ++s_presN;
-            const char *pd = std::getenv("PS2X_GS_PRESENT_SAVE");
-            // cont.230: PS2X_GS_PRESENT_SAVE_EVERY (default 32) / PS2X_GS_PRESENT_SAVE_SLOTS (default
-            // 16) make the rotation cover a whole level-era walk instead of its last ~13 s.
-            static const unsigned long s_presEvery = []
-            { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_EVERY"); unsigned long v = e ? std::strtoul(e, nullptr, 10) : 32ul; return v ? v : 32ul; }();
-            static const unsigned long s_presSlots = []
-            { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_SLOTS"); unsigned long v = e ? std::strtoul(e, nullptr, 10) : 16ul; return v ? v : 16ul; }();
-            // ★ cont.329 phase 4c: PS2X_GS_PRESENT_SAVE_BYFLIP=<n> names the file by the guest
-            // DISPLAY FLIP count instead of by a rotating presentation slot. Presentation is
-            // host-paced, so two renderers running at different speeds save different MOMENTS and
-            // a side-by-side compares nothing -- which defeated two attempts at exactly that
-            // comparison. The flip counter is guest-driven and, under deterministic replay,
-            // identical across runs, so flip K is the same instant in both.
-            static const unsigned long s_presByFlip = []
-            { const char *e = std::getenv("PS2X_GS_PRESENT_SAVE_BYFLIP"); return e ? std::strtoul(e, nullptr, 10) : 0ul; }();
-            static unsigned long s_lastSavedFlip = ~0ul;
-            const unsigned long s_flipNow = static_cast<unsigned long>(g_perfFlips.load());
-            const bool saveByFlip = pd && s_presByFlip && !pixels.empty() &&
-                                    (s_flipNow % s_presByFlip) == 0ul && s_flipNow != s_lastSavedFlip;
-            if (saveByFlip)
-                s_lastSavedFlip = s_flipNow;
-            if (saveByFlip || (pd && !s_presByFlip && g_gs2EraOpen &&
-                               (s_presN % s_presEvery) == 0u && !pixels.empty()))
-            {
-                char path[512];
-                if (saveByFlip)
-                    std::snprintf(path, sizeof(path), "%s/flip_%06lu.ppm", pd, s_flipNow);
-                else
-                    std::snprintf(path, sizeof(path), "%s/present_%02lu.ppm", pd, (s_presN / s_presEvery) % s_presSlots);
-                if (FILE *f = std::fopen(path, "wb"))
-                {
-                    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
-                    for (uint32_t yy = 0; yy < height; ++yy)
-                        for (uint32_t xx = 0; xx < width; ++xx)
-                        {
-                            const uint8_t *pp = pixels.data() + (yy * kHostFrameWidth + xx) * 4u;
-                            std::fputc(pp[0], f);
-                            std::fputc(pp[1], f);
-                            std::fputc(pp[2], f);
-                        }
-                    std::fclose(f);
-                    std::fprintf(stderr, "[gs2:present-save] %s src fbp=%u fbw=%u psm=0x%x %ux%u\n",
-                                 path, selected.fbp, selected.fbw, selected.psm, width, height);
-                }
-            }
-        }
+        // ★ amo_recomp 2026-10-15: with BOTH read circuits on, this lambda runs once per circuit, and saving here wrote
+        // circuit 1 then circuit 2 (the previous frame) as consecutive "presents" -- a fake every-other-present
+        // flicker. The two-circuit path defers to one save of the merged output (savePresented after the merge).
+        if (!deferPresentSave)
+            savePresented(pixels, width, height, selected);
         // Presentation-source trace (part of PS2X_GS_CENSUS2): one line per source change.
         if (s_gsCensus2)
         {
@@ -17619,6 +17628,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
 
     if (valid1 && valid2)
     {
+        deferPresentSave = true;
         GSFrameReg selected1{}, selected2{};
         std::vector<uint8_t> crt1, crt2;
         bool preferred1 = false, preferred2 = false;
@@ -17659,6 +17669,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
+            savePresented(result.pixels, result.width, result.height, selected1);
             return result;
         }
     }
