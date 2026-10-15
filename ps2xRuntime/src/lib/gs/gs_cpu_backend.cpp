@@ -29,6 +29,7 @@
 #include <set>
 #include <mutex>
 #include <vector>
+#include <chrono>
 #include <smmintrin.h> // cont.231: SSE4.1 bilinear filter (bilinear4)
 
 // PS2X_HAS_GS_GPU_DEVICE comes from CMake (desktop=1; Vita/Android=0, no EGL there).
@@ -10534,6 +10535,65 @@ void GSCpuBackend::drawCmpCheckpoint(const GSPrimitiveBatch *items, size_t count
     ++g_drawCmpN;
 }
 
+// PS2X_GS_FBPLOG=1 (diagnostic, default OFF; amo_recomp 2026-10-15): draws per target (FRAME fbp/psm/fbw) and
+// texture (TEX0 tbp0/psm when TME), summed and dumped every ~2 s of host time -- which buffers a frame is actually
+// drawn into (Auto Modellista: DISPFB alternates FBP 0/70 and FBP 70 presents black). Noted at both draw seams
+// (RasterRunFanOut and depth-0 DrawPrimitive), like the row census.
+static void fbpLogNote(const GSPrimitiveBatch &batch)
+{
+    const GSDrawState &state = batch.state;
+    const auto &ctx = state.context;
+    {
+        static const bool s_fbpLog = [] { const char *e = std::getenv("PS2X_GS_FBPLOG"); return e && e[0] == '1'; }();
+        if (s_fbpLog)
+        {
+            static std::mutex s_mx;
+            static std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>, uint64_t> s_counts;
+            static auto s_last = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(s_mx);
+            ++s_counts[std::make_tuple(ctx.frame.fbp, ctx.frame.psm, ctx.frame.fbw, state.prim.tme ? 1u : 0u,
+                                       state.prim.tme ? ctx.tex0.tbp0 : 0u, state.prim.tme ? ctx.tex0.psm : 0u)];
+            static std::map<std::pair<uint32_t, uint32_t>, std::string> s_samples;   // first draw per (fbp, tme), per window
+            const auto sampleKey = std::make_pair(ctx.frame.fbp, (state.prim.tme ? 1u : 0u) | (state.prim.ctxt ? 2u : 0u));
+            if (!s_samples.count(sampleKey))
+            {
+                char buf[400];
+                std::snprintf(buf, sizeof(buf),
+                              "fbmsk=%08x scissor=(%u,%u)-(%u,%u) xyofs=(%u,%u)=(%.2f,%.2f) test=%016llx alpha=%016llx "
+                              "zbp=%u zpsm=0x%x zmsk=%u prim=%d abe=%u v0=(%.1f,%.1f,z=%.0f) v1=(%.1f,%.1f) rgba=%02x%02x%02x%02x n=%u",
+                              ctx.frame.fbmsk, ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1,
+                              ctx.xyoffset.ofx, ctx.xyoffset.ofy, ctx.xyoffset.ofx / 16.0, ctx.xyoffset.ofy / 16.0,
+                              (unsigned long long)ctx.test, (unsigned long long)ctx.alpha, ctx.zbuf.zbp, ctx.zbuf.psm,
+                              ctx.zbuf.zmask ? 1u : 0u, static_cast<int>(state.prim.type), state.prim.abe ? 1u : 0u,
+                              batch.vertices[0].x, batch.vertices[0].y, batch.vertices[0].z,
+                              batch.vertexCount > 1 ? batch.vertices[1].x : 0.0f, batch.vertexCount > 1 ? batch.vertices[1].y : 0.0f,
+                              batch.vertices[0].r, batch.vertices[0].g, batch.vertices[0].b, batch.vertices[0].a, batch.vertexCount);
+                s_samples[sampleKey] = buf;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_last > std::chrono::seconds(2))
+            {
+                s_last = now;
+                std::vector<std::pair<uint64_t, std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>> v;
+                for (const auto &[k, c] : s_counts)
+                    v.emplace_back(c, k);
+                std::sort(v.rbegin(), v.rend());
+                std::fprintf(stderr, "[gs:fbplog] %zu targets/textures (last ~2 s):\n", v.size());
+                for (size_t i = 0; i < v.size() && i < 12; ++i)
+                {
+                    const auto &[fbp, psm, fbw, tme, tbp, tpsm] = v[i].second;
+                    std::fprintf(stderr, "[gs:fbplog]   %8llu draws  fbp=%u psm=0x%x fbw=%u  tme=%u tbp=%u tpsm=0x%x\n",
+                                 (unsigned long long)v[i].first, fbp, psm, fbw, tme, tbp, tpsm);
+                }
+                for (const auto &[key, text] : s_samples)
+                    std::fprintf(stderr, "[gs:fbplog]   sample fbp=%u tme=%u ctxt=%u: %s\n", key.first, key.second & 1u, key.second >> 1, text.c_str());
+                s_samples.clear();
+                s_counts.clear();
+            }
+        }
+    }
+}
+
 void GSCpuBackend::RasterRunFanOut(const GSPrimitiveBatch *items, size_t count)
 {
     if (count == 0)
@@ -10545,6 +10605,10 @@ void GSCpuBackend::RasterRunFanOut(const GSPrimitiveBatch *items, size_t count)
         for (size_t i = 0; i < count; ++i)
             if (items[i].vertexCount != 0u)
                 rowCensusNote(items[i]);
+    if (rcDepth.top())
+        for (size_t i = 0; i < count; ++i)
+            if (items[i].vertexCount != 0u)
+                fbpLogNote(items[i]);
     // ★ cont.231: the NORASTER ablation must skip the RUN path too. The flag was only checked inside
     // DrawPrimitive, which the band threads never enter (bandWorkerLoop -> RasterBand directly), so
     // with the pool on by default (cont.210) "raster ABLATED" runs still drew two of every three bands
@@ -11304,6 +11368,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         rasterCapRecord(batch);
     if (s_gsStateCensus)
         stateCensusRecord(batch);
+    if (t_rowCensusDepth == 0u && batch.vertexCount != 0u)
+        fbpLogNote(batch);
     // PS2X_GS_FONTTRACE: draw-ORDER stamps -- a glyph draw vs the full-screen cover quad. The
     // menu text is drawn with white texels (proven by [gs2:fontsamp]) yet the completed frame
     // holds none: if an untextured full-width sprite lands on fbp 0/128 AFTER the glyphs (seq
@@ -17329,6 +17395,19 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     PresentationFrame result{};
     const GSPmodeState pmode = decodePmode(request.pmode);
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
+    // PS2X_GS_MERGELOG=1 (diagnostic, default off): print the merge-circuit registers whenever they change.
+    {
+        static const bool s_mergeLog = [] { const char *e = std::getenv("PS2X_GS_MERGELOG"); return e && e[0] == '1'; }();
+        static uint64_t s_last[7] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+        const uint64_t now[7] = {request.pmode, request.smode2, request.dispfb1, request.display1, request.dispfb2, request.display2, request.bgcolor};
+        if (s_mergeLog && std::memcmp(now, s_last, sizeof(now)) != 0)
+        {
+            std::memcpy(s_last, now, sizeof(now));
+            std::fprintf(stderr, "[gs:merge] pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bgcolor=%llx\n",
+                         (unsigned long long)now[0], (unsigned long long)now[1], (unsigned long long)now[2], (unsigned long long)now[3],
+                         (unsigned long long)now[4], (unsigned long long)now[5], (unsigned long long)now[6]);
+        }
+    }
     const bool fieldMode = smode2.interlaced && !smode2.frameMode && s_gsFieldBob; // cont.232: full frame by default
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
@@ -17425,6 +17504,30 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         }
         if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
             return false;
+        // PS2X_GS_VRAMDUMP_PRESENT=<path>:<n> (diagnostic, default OFF; amo_recomp 2026-10-15): write the raw 4 MB GS
+        // local memory once, at the n-th present, plus the displayed FRAME -- to tell "drawn elsewhere" from "read
+        // wrong" for a display buffer that presents black.
+        {
+            static const char *s_vdSpec = std::getenv("PS2X_GS_VRAMDUMP_PRESENT");
+            static unsigned long s_vdN = 0;
+            if (s_vdSpec && s_vdSpec[0] && m_vram && m_vramSize)
+            {
+                const std::string spec(s_vdSpec);
+                const size_t colon = spec.rfind(':');
+                const unsigned long at = colon != std::string::npos ? std::strtoul(spec.c_str() + colon + 1, nullptr, 10) : 600ul;
+                if (++s_vdN == at)
+                {
+                    const std::string path = colon != std::string::npos ? spec.substr(0, colon) : spec;
+                    if (FILE *f = std::fopen(path.c_str(), "wb"))
+                    {
+                        std::fwrite(m_vram, 1, m_vramSize, f);
+                        std::fclose(f);
+                    }
+                    std::fprintf(stderr, "[gs:vramdump] present #%lu -> %s (fbp=%u fbw=%u psm=0x%x)\n", s_vdN, path.c_str(),
+                                 displayFrame.fbp, displayFrame.fbw, displayFrame.psm);
+                }
+            }
+        }
         // Present-output save (PS2X_GS_PRESENT_SAVE=<dir>): every 512th present, save the
         // EXACT pixels handed to the viewer (rotating 4 slots) — separates "presentation reads
         // wrong" from "viewer blit wrong".

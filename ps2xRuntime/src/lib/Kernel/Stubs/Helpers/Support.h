@@ -1,3 +1,4 @@
+void ps2xGsOrderLogText(const char *text);   // gs/gs_frontend.cpp (PS2X_GS_ORDERLOG)
 #include <algorithm>
 #include <cctype>
 #include "runtime/ps2_gs_pipeline.h"
@@ -1375,8 +1376,15 @@ namespace
         mem.writeIORegister(channelBase + 0x20u, qwc & 0xFFFFu);
         mem.writeIORegister(channelBase + 0x10u, madr);
         mem.writeIORegister(channelBase + 0x30u, tadr);
+        {
+            char t[96];
+            std::snprintf(t, sizeof(t), "sceDmaSend ch=0x%08x tadr=0x%x qwc=%u (stub) -> start + process", channelBase, tadr, qwc);
+            ps2xGsOrderLogText(t);   // PS2X_GS_ORDERLOG (diagnostic, default OFF)
+        }
         mem.writeIORegister(channelBase + 0x00u, chcr);
         mem.processPendingTransfers();
+        if ((mem.readIORegister(channelBase + 0x00u) & 0x100u) != 0u)
+            ps2xGsOrderLogText("  ...sceDmaSend: channel STILL BUSY after processPendingTransfers (deferred)");
 
         std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
         if (completedCauses.empty() && (mem.readIORegister(channelBase + 0x00u) & 0x100u) == 0u)

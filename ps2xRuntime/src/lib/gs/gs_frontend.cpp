@@ -9,9 +9,76 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+
+// PS2X_GS_ORDERLOG=1 (diagnostic, default OFF; amo_recomp 2026-10-15): the GS's own event order as the front-end
+// receives it -- draw-kick runs (target fbp + kind), FRAME changes and DISPFB writes on ONE timeline, from the
+// 40th DISPFB1 change on, ~150 lines. Answers "which buffer does each frame's clear hit, and when relative to the swap".
+namespace
+{
+    bool orderLogOn()
+    {
+        static const bool on = [] { const char *e = std::getenv("PS2X_GS_ORDERLOG"); return e && e[0] == '1'; }();
+        return on;
+    }
+    unsigned g_orderFlips = 0, g_orderLines = 0, g_orderRunCount = 0;
+    std::string g_orderRunKey;
+    bool orderLogArmed() { return orderLogOn() && g_orderFlips >= 40u && g_orderLines < 150u; }
+    void orderLogFlushRun()
+    {
+        if (!g_orderRunKey.empty() && g_orderRunCount && orderLogArmed())
+        {
+            ++g_orderLines;
+            std::fprintf(stderr, "[gs:order] %u x %s\n", g_orderRunCount, g_orderRunKey.c_str());
+        }
+        g_orderRunKey.clear();
+        g_orderRunCount = 0;
+    }
+    void orderLogEvent(const char *text)
+    {
+        if (!orderLogOn())
+            return;
+        orderLogFlushRun();
+        if (orderLogArmed())
+        {
+            ++g_orderLines;
+            std::fprintf(stderr, "[gs:order] -- %s\n", text);
+        }
+    }
+    void orderLogDraw(const std::string &key)
+    {
+        if (!orderLogArmed())
+            return;
+        if (key != g_orderRunKey)
+        {
+            orderLogFlushRun();
+            g_orderRunKey = key;
+        }
+        ++g_orderRunCount;
+    }
+}
+
+// Generic timeline entry for other subsystems (DMA starts, sceDmaSend): PS2X_GS_ORDERLOG.
+void ps2xGsOrderLogText(const char *text)
+{
+    orderLogEvent(text);
+}
+
+// Called by the EE store path (ps2_memory.cpp) for DISPFB1/2 writes, which bypass the front-end's register switch.
+void ps2xGsOrderLogDispfb(int which, uint64_t pre, uint64_t now)
+{
+    if (!orderLogOn() || pre == now)
+        return;
+    if (which == 1)
+        ++g_orderFlips;
+    char t[64];
+    std::snprintf(t, sizeof(t), "DISPFB%d (EE store) fbp %u -> %u", which, static_cast<unsigned>(pre & 0x1FF),
+                  static_cast<unsigned>(now & 0x1FF));
+    orderLogEvent(t);
+}
 
 namespace
 {
@@ -1660,6 +1727,23 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_FRAME_2:
     {
         int ci = (regAddr == GS_REG_FRAME_2) ? 1 : 0;
+        {
+            // PS2X_GS_FBPLOG=1 (diagnostic, default OFF): FRAME_1/FRAME_2 target changes, in GS register order.
+            static const bool s_log = [] { const char *e = std::getenv("PS2X_GS_FBPLOG"); return e && e[0] == '1'; }();
+            static unsigned s_n = 0;
+            const uint32_t fbp = static_cast<uint32_t>(value & 0x1FF);
+            if (fbp != m_ctx[ci].frame.fbp)
+            {
+                char t[64];
+                std::snprintf(t, sizeof(t), "FRAME_%d fbp %u -> %u", ci + 1, m_ctx[ci].frame.fbp, fbp);
+                orderLogEvent(t);
+            }
+            if (s_log && fbp != m_ctx[ci].frame.fbp && s_n < 200u)
+            {
+                ++s_n;
+                std::fprintf(stderr, "[gs:framelog] FRAME_%d fbp %u -> %u\n", ci + 1, m_ctx[ci].frame.fbp, fbp);
+            }
+        }
         m_ctx[ci].frame.fbp = static_cast<uint32_t>(value & 0x1FF);
         m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
         m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
@@ -1830,6 +1914,14 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             const bool flipped = m_privRegs->dispfb1 != value;
             const uint64_t preFb1 = m_privRegs->dispfb1, preFb2 = m_privRegs->dispfb2;
             m_privRegs->dispfb1 = value;
+            if (flipped)
+            {
+                ++g_orderFlips;
+                char t[64];
+                std::snprintf(t, sizeof(t), "DISPFB1 (frontend) fbp %u -> %u", static_cast<unsigned>(preFb1 & 0x1FF),
+                              static_cast<unsigned>(value & 0x1FF));
+                orderLogEvent(t);
+            }
             g_ps2xGsLiveDispfb1.store(value, std::memory_order_release); // cont.345
             // Display flip = a frame just completed in the PRE-write front buffer: snapshot
             // it for presentation (cont.165 menu-text fix; see gs_cpu_backend.cpp).
@@ -2073,6 +2165,12 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
                 static_cast<uint16_t>(1u << std::min<uint32_t>(ctx.tex0.tw, 10u)),
                 static_cast<uint16_t>(1u << std::min<uint32_t>(ctx.tex0.th, 10u)),
                 mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u}};
+    }
+    if (orderLogOn())
+    {
+        const GSContext &octx = m_ctx[m_prim.ctxt ? 1 : 0];
+        const char *kind = m_prim.tme ? "textured" : (m_prim.abe ? "untex-blend" : "untex-opaque(clear?)");
+        orderLogDraw("draw fbp=" + std::to_string(octx.frame.fbp) + " " + kind);
     }
     GSPrimitiveBatch batch{};
     batch.vertexCount = static_cast<uint8_t>(std::min(vertexCount, 3));

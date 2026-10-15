@@ -1,4 +1,6 @@
 #include "runtime/ps2_pipe_capture.h"
+void ps2xGsOrderLogDispfb(int which, uint64_t pre, uint64_t now);   // gs/gs_frontend.cpp
+void ps2xGsOrderLogText(const char *text);   // gs/gs_frontend.cpp
 #include "runtime/ps2_gs_pipeline.h"
 bool ps2xVif1DirectSpanQuiescent();
 extern "C" int ps2xGsGifParseQuiescent();
@@ -1086,6 +1088,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             *reg = newVal;
             if (changed && (regOff == 0x0070u || regOff == 0x0090u))
                 ps2xGsNotifyDisplayFlip(preFb1, preFb2);
+            ps2xGsOrderLogDispfb(1, preFb1, gs_regs.dispfb1);   // PS2X_GS_ORDERLOG (diagnostic, default OFF)
+            ps2xGsOrderLogDispfb(2, preFb2, gs_regs.dispfb2);
         }
         return;
     }
@@ -1153,7 +1157,9 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
             const uint64_t preFb1 = gs_regs.dispfb1, preFb2 = gs_regs.dispfb2;
             *reg = value;
             if (changed && (regOff == 0x0070u || regOff == 0x0090u))
-                ps2xGsNotifyDisplayFlip(preFb1, preFb2); // display flip -> presentation snapshot (cont.165)
+                ps2xGsNotifyDisplayFlip(preFb1, preFb2);
+            ps2xGsOrderLogDispfb(1, preFb1, gs_regs.dispfb1);   // PS2X_GS_ORDERLOG (diagnostic, default OFF)
+            ps2xGsOrderLogDispfb(2, preFb2, gs_regs.dispfb2); // display flip -> presentation snapshot (cont.165)
         }
         return;
     }
@@ -1341,7 +1347,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint64_t preFb1 = gs_regs.dispfb1, preFb2 = gs_regs.dispfb2;
             *reg = newVal;
             if (changed && (regOff == 0x0070u || regOff == 0x0090u))
-                ps2xGsNotifyDisplayFlip(preFb1, preFb2); // display flip -> presentation snapshot (cont.165)
+                ps2xGsNotifyDisplayFlip(preFb1, preFb2);
+            ps2xGsOrderLogDispfb(1, preFb1, gs_regs.dispfb1);   // PS2X_GS_ORDERLOG (diagnostic, default OFF)
+            ps2xGsOrderLogDispfb(2, preFb2, gs_regs.dispfb2); // display flip -> presentation snapshot (cont.165)
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -1518,6 +1526,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            if (channelBase == 0x10009000u || channelBase == 0x1000A000u || channelBase == 0x10008000u)
+            {
+                char t[112];
+                std::snprintf(t, sizeof(t), "DMA start ch=0x%08x chcr=0x%08x madr=0x%x qwc=%u tadr=0x%x (CHCR write: queued)",
+                              channelBase, value, madr, qwc, m_ioRegisters[channelBase + 0x30]);
+                ps2xGsOrderLogText(t);   // PS2X_GS_ORDERLOG (diagnostic, default OFF)
+            }
 
             // Upstream 75d729c's NORMAL-mode scratchpad DMA (ch8/ch9) owns normal mode; ours (rows 12/40, below) keeps
             // chain + interleave. A/B 2026-10-06 (row 265): with it on, the rotk fight replay was bit-identical over 6,272
