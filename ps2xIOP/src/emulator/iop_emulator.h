@@ -34,6 +34,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t softwareRegister(uint32_t index) const noexcept;
         void setSpu2Enabled(bool enabled);
         void setPadSource(std::function<bool(int, uint8_t *, size_t)> source);
+        void setPadVibrationSink(std::function<void(int, float, float)> sink);
         void setNativeExecutor(ps2x::iop::IopNativeExecutor *executor);   // rotk row 276
         void onSifTransfer(const SifTransfer &transfer);
 

@@ -234,6 +234,11 @@ namespace ps2x::iop
         m_impl->emulator.setPadSource(std::move(source));
     }
 
+    void IopSubsystem::setPadVibrationSink(PadVibrationSink sink)
+    {
+        m_impl->emulator.setPadVibrationSink(std::move(sink));
+    }
+
     void IopSubsystem::setSpu2Enabled(bool enabled)
     {
         m_impl->emulator.setSpu2Enabled(enabled);

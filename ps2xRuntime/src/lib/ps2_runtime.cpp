@@ -637,6 +637,14 @@ PS2Runtime::PS2Runtime()
     // PS2X_PAD_SCRIPT): slot 0 of each port, libpad's raw buffer; false = no pad on that port.
     m_iopSubsystem->setPadSource([this](int port, uint8_t *raw, size_t size)
                                  { return m_padBackend.readState(port, 0, raw, size); });
+    // ...and its motors drive the same rumble as the HLE pad (PSPadBackend::setVibration: small = on/off bit,
+    // large = 0-255; applied on the main thread). PCSX2 PadDualshock2::Poll hands them over as 0..1 intensities.
+    m_iopSubsystem->setPadVibrationSink([](int port, float large, float small)
+                                        {
+                                            const float l = large < 0.0f ? 0.0f : (large > 1.0f ? 1.0f : large);
+                                            PSPadBackend::setVibration(port, small > 0.0f ? 1u : 0u,
+                                                                       static_cast<uint8_t>(l * 255.0f + 0.5f));
+                                        });
     if (ps2x::iop::IopNativeExecutor *executor = ps2x::iop::native::defaultExecutor())   // rotk row 276
         m_iopSubsystem->setNativeExecutor(executor);
 

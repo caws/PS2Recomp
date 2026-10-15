@@ -259,6 +259,15 @@ namespace ps2x::iop::detail
 
         std::function<bool(int, uint8_t *, size_t)> padSource;
 
+        // The DualShock 2's motors as PCSX2 sets them (InputManager::SetPadVibrationIntensity, 0..1 each).
+        void padVibration(int port, float large, float small) override
+        {
+            if (padVibrationSink)
+                padVibrationSink(port, large, small);
+        }
+
+        std::function<void(int, float, float)> padVibrationSink;
+
         // ---- the USB controller's view of this IOP (ps2x::usb::Host) ------------------------------------------------
         void usbInterrupt(int delayCycles) override
         {
@@ -1092,6 +1101,11 @@ namespace ps2x::iop::detail
     void IopEmulator::setPadSource(std::function<bool(int, uint8_t *, size_t)> source)
     {
         m_impl->padSource = std::move(source);
+    }
+
+    void IopEmulator::setPadVibrationSink(std::function<void(int, float, float)> sink)
+    {
+        m_impl->padVibrationSink = std::move(sink);
     }
 
     void IopEmulator::setSpu2Enabled(bool enabled)

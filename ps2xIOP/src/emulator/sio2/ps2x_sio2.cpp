@@ -141,8 +141,21 @@ PadBase *Pad::GetPad(u8 port, u8 slot)
 
 void InputManager::SetPadVibrationIntensity(u32 pad_index, float large_or_single_motor_intensity, float small_motor_intensity)
 {
-    if (s_host)
-        s_host->padVibration(static_cast<int>(pad_index), large_or_single_motor_intensity, small_motor_intensity);
+    // pad_index is PCSX2's unified slot (sioConvertPortAndSlotToPad); without a multitap only 1A/2A (= port) exist.
+    const auto [port, slot] = sioConvertPadToPortAndSlot(pad_index);
+    if (logOn() && pad_index < 2u)   // PS2X_SIO2_LOG: every change of a port's motor strengths
+    {
+        static float s_last[2][2] = {{-1.0f, -1.0f}, {-1.0f, -1.0f}};
+        if (s_last[pad_index][0] != large_or_single_motor_intensity || s_last[pad_index][1] != small_motor_intensity)
+        {
+            s_last[pad_index][0] = large_or_single_motor_intensity;
+            s_last[pad_index][1] = small_motor_intensity;
+            std::fprintf(stderr, "[sio2:rumble] port %u large=%.3f small=%.0f\n", static_cast<unsigned>(port),
+                         large_or_single_motor_intensity, small_motor_intensity);
+        }
+    }
+    if (s_host && slot == 0)
+        s_host->padVibration(static_cast<int>(port), large_or_single_motor_intensity, small_motor_intensity);
 }
 
 // ---- PCSX2 Common.h iopIntcIrq (only Sio2::Interrupt calls it here: IRQ 17) ---------------------------------------

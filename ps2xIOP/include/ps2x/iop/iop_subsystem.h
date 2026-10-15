@@ -47,6 +47,9 @@ namespace ps2x::iop
         // (bytes 2-3 buttons active-low, 4-7 rx ry lx ly); return false when nothing drives the port.
         using PadSource = std::function<bool(int port, uint8_t *raw, size_t size)>;
         void setPadSource(PadSource source);
+        // The DualShock 2's motor strengths when the game drives them (large = variable motor, small = on/off), 0..1.
+        using PadVibrationSink = std::function<void(int port, float large, float small)>;
+        void setPadVibrationSink(PadVibrationSink sink);
         // rotk row 276: run statically recompiled IOP modules through `executor` (nullptr = interpret everything).
         void setNativeExecutor(IopNativeExecutor *executor);
         [[nodiscard]] uint64_t iopCycles() const noexcept;   // the emulated IOP's cycle count
