@@ -47,6 +47,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        constexpr uint64_t kSifDmaIntrCycles = 128u;   // sceSifSetDmaIntr completion callback delay (the copy is instant)
         constexpr int kSpu2Irq = 9;   // PCSX2 IopIrq.cpp spu2Irq: iopIntcIrq(9)
         constexpr int kSio2Irq = 17;   // PCSX2 Sio2::Interrupt: iopIntcIrq(17)
         constexpr int kUsbIrq = 22;   // PCSX2 IopIrq.cpp usbIrq -> IopEvt_USB: the OHCI controller's IOP interrupt line
@@ -496,6 +497,22 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
+                // sceSifSetDmaIntr(dmat, count, completioncb, userdata) (ordinal 32, ps2sdk sifman.h): sceSifSetDma
+                // plus a completion callback the SIF0 DMA-end interrupt runs. The transfer is instantaneous here, so
+                // the callback is queued just after it, like a CDVD completion. It was unhandled (sifman's default
+                // returns 0 = "failed"): DBCMAN printed "sceSifSetDma faild" and waited forever on the semaphore its
+                // callback signals, so the pad was polled once and never again.
+                if (call.ordinal == 32)
+                {
+                    const uint32_t completion = cpu.gpr[6];
+                    const uint32_t userdata = cpu.gpr[7];
+                    const uint32_t gp = cpu.gpr[28];
+                    (void)rpc.dispatchSifManImport(7, cpu);   // same dmat/count arguments; v0 = DMA id, 0 = failure
+                    if (cpu.gpr[2] != 0u && completion != 0u)
+                        pendingGuestCallbacks.emplace(totalCycles + kSifDmaIntrCycles,
+                                                      ScheduledGuestCallback{completion, gp, userdata});
+                    return ImportDisposition::Handled;
+                }
                 return rpc.dispatchSifManImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
