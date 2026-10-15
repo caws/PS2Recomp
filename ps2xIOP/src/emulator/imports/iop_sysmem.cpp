@@ -27,9 +27,15 @@ namespace ps2x::iop::detail
         {
         case 4: // AllocSysMemory
         {
+            // sysmem manages RAM in 256-byte blocks: sizes round up ((size + 255) >> 8) and every block starts on a
+            // 256-byte boundary; ALLOC_ADDRESS (mode 2) takes the block containing the requested address (ps2sdk
+            // iop/system/sysmem/src/sysmem.c; PCSX2 runs the real IOP kernel). Callers rely on it: USBD.IRX puts the
+            // OHCI HCCA, which must be 256-aligned, at the start of its block and gives up when (block & 0xff) != 0.
+            constexpr uint32_t kBlock = 0x100u;
+            const uint32_t size = (a1 + (kBlock - 1u)) & ~(kBlock - 1u);
             const uint32_t address = a0 == 2u
-                                         ? m_memory.allocate(a1, 16u, a2)
-                                         : m_memory.allocate(a1, 16u);
+                                         ? m_memory.allocate(size, kBlock, a2 & ~(kBlock - 1u))
+                                         : m_memory.allocate(size, kBlock);
             setV0(address);
             return true;
         }
