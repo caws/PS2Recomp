@@ -2,6 +2,7 @@
 
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
+#include <functional>
 #include "ps2x/iop/iop_native_bridge.h"
 
 #include <memory>
@@ -42,6 +43,10 @@ namespace ps2x::iop
         [[nodiscard]] uint32_t iopSoftwareRegister(uint32_t index) const noexcept;
         // rotk row 273: emulate the SPU2 (PCSX2's core) behind the IOP's sound registers and DMA 4/7. OFF by default.
         void setSpu2Enabled(bool enabled);
+        // The controller state SIO2's DualShock 2 reports (emulator/sio2/): libpad's raw buffer for `port`
+        // (bytes 2-3 buttons active-low, 4-7 rx ry lx ly); return false when nothing drives the port.
+        using PadSource = std::function<bool(int port, uint8_t *raw, size_t size)>;
+        void setPadSource(PadSource source);
         // rotk row 276: run statically recompiled IOP modules through `executor` (nullptr = interpret everything).
         void setNativeExecutor(IopNativeExecutor *executor);
         [[nodiscard]] uint64_t iopCycles() const noexcept;   // the emulated IOP's cycle count

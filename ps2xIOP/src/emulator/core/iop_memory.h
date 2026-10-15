@@ -139,6 +139,7 @@ namespace ps2x::iop::detail
         // reports it done (spu2DmaComplete).
         void setSpu2Enabled(bool enabled) noexcept { m_spu2Enabled = enabled; }
         [[nodiscard]] static bool usbEnabled();
+        [[nodiscard]] static bool sio2Enabled();
         [[nodiscard]] bool spu2Enabled() const noexcept { return m_spu2Enabled; }
         void spu2DmaComplete(int core);
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }

@@ -5,6 +5,7 @@
 #include "ps2x/iop/iop_native_bridge.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -32,6 +33,7 @@ namespace ps2x::iop::detail
                              uint32_t eeExtraSource, uint32_t iopExtraDestination, uint32_t extraSize);
         [[nodiscard]] uint32_t softwareRegister(uint32_t index) const noexcept;
         void setSpu2Enabled(bool enabled);
+        void setPadSource(std::function<bool(int, uint8_t *, size_t)> source);
         void setNativeExecutor(ps2x::iop::IopNativeExecutor *executor);   // rotk row 276
         void onSifTransfer(const SifTransfer &transfer);
 

@@ -633,6 +633,10 @@ PS2Runtime::PS2Runtime()
 {
     m_iopHost = std::make_unique<PS2IopHostAdapter>(*this);
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
+    // The emulated IOP's SIO2 DualShock 2 reads the same pad backend as the HLE DBCMAN (keyboard, gamepad,
+    // PS2X_PAD_SCRIPT): slot 0 of each port, libpad's raw buffer; false = no pad on that port.
+    m_iopSubsystem->setPadSource([this](int port, uint8_t *raw, size_t size)
+                                 { return m_padBackend.readState(port, 0, raw, size); });
     if (ps2x::iop::IopNativeExecutor *executor = ps2x::iop::native::defaultExecutor())   // rotk row 276
         m_iopSubsystem->setNativeExecutor(executor);
 

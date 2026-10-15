@@ -18,6 +18,7 @@
 #include "iop_emulator_const.h"
 #include "spu2/ps2x_spu2.h"
 #include "usb/ps2x_usb.h"
+#include "sio2/ps2x_sio2.h"
 #include "ps2x/iop/iop_native_bridge.h"
 
 #include <algorithm>
@@ -47,6 +48,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
         constexpr int kSpu2Irq = 9;   // PCSX2 IopIrq.cpp spu2Irq: iopIntcIrq(9)
+        constexpr int kSio2Irq = 17;   // PCSX2 Sio2::Interrupt: iopIntcIrq(17)
         constexpr int kUsbIrq = 22;   // PCSX2 IopIrq.cpp usbIrq -> IopEvt_USB: the OHCI controller's IOP interrupt line
         constexpr uint64_t kSpu2TickCycles = 768u;   // PCSX2 IopCounters: counter 6 (the SPU2) rate, one 48 kHz sample
 
@@ -76,7 +78,7 @@ namespace ps2x::iop::detail
     }
 
     class IopEmulator::Impl final : public IopGuestExecutor, public ps2x::spu2::Host, public ps2x::usb::Host,
-                                    public ps2x::iop::IopNativeServices
+                                    public ps2x::sio2::Host, public ps2x::iop::IopNativeServices
     {
     public:
         using CpuState = IopCpuState;
@@ -125,6 +127,8 @@ namespace ps2x::iop::detail
         {
             if (IopMemory::usbEnabled())
                 ps2x::usb::attach(this);
+            if (IopMemory::sio2Enabled())
+                ps2x::sio2::attach(this);
             reset();
         }
 
@@ -140,6 +144,8 @@ namespace ps2x::iop::detail
             timrman.reset();
             ioman.reset();
             ps2x::usb::reset();
+            if (IopMemory::sio2Enabled())
+                ps2x::sio2::reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -238,6 +244,19 @@ namespace ps2x::iop::detail
         {
             return const_cast<uint8_t *>(memory.ram().data());
         }
+
+        // ---- the SIO2 port's view of this IOP (ps2x::sio2::Host) ---------------------------------------------------
+        void sio2Interrupt() override
+        {
+            pendingDmaInterrupts[kSio2Irq] = totalCycles;   // PCSX2 Sio2::Interrupt: iopIntcIrq(17), serviced unnested
+        }
+
+        bool padState(int port, uint8_t *raw, size_t size) override
+        {
+            return padSource ? padSource(port, raw, size) : false;
+        }
+
+        std::function<bool(int, uint8_t *, size_t)> padSource;
 
         // ---- the USB controller's view of this IOP (ps2x::usb::Host) ------------------------------------------------
         void usbInterrupt(int delayCycles) override
@@ -1051,6 +1070,11 @@ namespace ps2x::iop::detail
     void IopEmulator::setNativeExecutor(ps2x::iop::IopNativeExecutor *executor)
     {
         m_impl->setNativeExecutor(executor);
+    }
+
+    void IopEmulator::setPadSource(std::function<bool(int, uint8_t *, size_t)> source)
+    {
+        m_impl->padSource = std::move(source);
     }
 
     void IopEmulator::setSpu2Enabled(bool enabled)

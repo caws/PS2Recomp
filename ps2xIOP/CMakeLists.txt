@@ -68,6 +68,24 @@ target_compile_options(ps2x_usb PRIVATE
     -include ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/usb/shim/ps2x_usb_prelude.h -w)
 target_link_libraries(ps2_iop PRIVATE ps2x_usb)
 
+# ---- PCSX2's SIO2 + DualShock 2 (GPL-3.0+, see src/emulator/sio2/README.md) ------------------------------------------
+add_library(ps2x_sio2 STATIC
+    src/emulator/sio2/ps2x_sio2.cpp
+    src/emulator/sio2/pcsx2/SIO/Sio2.cpp
+    src/emulator/sio2/pcsx2/SIO/Pad/PadBase.cpp
+    src/emulator/sio2/pcsx2/SIO/Pad/PadDualshock2.cpp
+    src/emulator/sio2/pcsx2/SIO/Pad/PadNotConnected.cpp
+    src/emulator/sio2/pcsx2/SIO/Multitap/MultitapProtocol.cpp
+    src/emulator/sio2/pcsx2/SIO/Memcard/MemoryCardProtocol.cpp
+)
+target_compile_features(ps2x_sio2 PUBLIC cxx_std_20)
+target_include_directories(ps2x_sio2 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/sio2/shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/sio2/pcsx2)
+target_compile_options(ps2x_sio2 PRIVATE
+    -include ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/sio2/shim/ps2x_sio2_prelude.h -w)
+target_link_libraries(ps2_iop PRIVATE ps2x_sio2)
+
 target_include_directories(ps2_iop
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

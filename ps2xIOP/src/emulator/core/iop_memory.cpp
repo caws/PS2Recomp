@@ -1,5 +1,6 @@
 #include "iop_memory.h"
 #include "../usb/ps2x_usb.h"
+#include "../sio2/ps2x_sio2.h"
 #include <cstdlib>
 #include "../spu2/ps2x_spu2.h"
 
@@ -50,6 +51,8 @@ namespace ps2x::iop::detail
     uint8_t IopMemory::read8Slow(uint32_t address) const
     {
         const uint32_t phys = physicalAddress(address);
+        if (phys >= ps2x::sio2::kRegBase && phys < ps2x::sio2::kRegEnd && sio2Enabled())
+            return ps2x::sio2::read8(phys);   // PCSX2 iopHwRead8_Page8: RX pops the response FIFO
         if (m_spu2Enabled && isSpu2Register(phys))
             return static_cast<uint8_t>(ps2x::spu2::read16(phys & ~1u) >> ((phys & 1u) * 8u));
         if (phys < RamSize)
@@ -103,6 +106,11 @@ namespace ps2x::iop::detail
     void IopMemory::write8Slow(uint32_t address, uint8_t value)
     {
         const uint32_t phys = physicalAddress(address);
+        if (phys >= ps2x::sio2::kRegBase && phys < ps2x::sio2::kRegEnd && sio2Enabled())
+        {
+            ps2x::sio2::write8(phys, value);   // PCSX2 iopHwWrite8_Page8: TX pushes a command byte
+            return;
+        }
         if (m_spu2Enabled && isSpu2Register(phys))
         {
             // 8-bit SPU2 writes: PCSX2 psxHw4Write8 forwards them as 16-bit writes of the byte.
@@ -246,10 +254,20 @@ namespace ps2x::iop::detail
         return on;
     }
 
+    // SIO2 (PCSX2's, emulator/sio2/): the controller/memory-card port, always present on hardware; on by default,
+    // PS2X_IOP_SIO2=0 restores the plain register store (A/B).
+    bool IopMemory::sio2Enabled()
+    {
+        static const bool on = [] { const char *e = std::getenv("PS2X_IOP_SIO2"); return !(e && e[0] == '0'); }();
+        return on;
+    }
+
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
         if (address >= ps2x::usb::kRegBase && address < ps2x::usb::kRegEnd && usbEnabled())
             return ps2x::usb::read32(address);
+        if (address >= ps2x::sio2::kRegBase && address < ps2x::sio2::kRegEnd && sio2Enabled())
+            return ps2x::sio2::read32(address);
         if (m_spu2Enabled)
         {
             if (address == kDmaSpu0Madr || address == kDmaSpu1Madr)
@@ -278,6 +296,35 @@ namespace ps2x::iop::detail
         if (address >= ps2x::usb::kRegBase && address < ps2x::usb::kRegEnd && usbEnabled())
         {
             ps2x::usb::write32(address, value);
+            return;
+        }
+        if (address >= ps2x::sio2::kRegBase && address < ps2x::sio2::kRegEnd && sio2Enabled())
+        {
+            ps2x::sio2::write32(address, value);
+            return;
+        }
+        // PCSX2 IopDma.cpp psxDma11 (SIO2 in) / psxDma12 (SIO2 out): the transfer runs at the CHCR write; the channel's
+        // DMA interrupt (intrman 0x2C / 0x2D) follows after size/4 cycles (PSX_INT(IopEvt_Dma11/12, size >> 2)).
+        constexpr uint32_t kDma11Madr = 0x1F801540u, kDma11Bcr = 0x1F801544u, kDma11Chcr = 0x1F801548u;
+        constexpr uint32_t kDma12Madr = 0x1F801550u, kDma12Bcr = 0x1F801554u, kDma12Chcr = 0x1F801558u;
+        if ((address == kDma11Chcr || address == kDma12Chcr) && (value & (1u << 24)) != 0u && sio2Enabled())
+        {
+            const bool in = address == kDma11Chcr;
+            const uint32_t madrReg = in ? kDma11Madr : kDma12Madr;
+            uint32_t madr = 0u, bcr = 0u;
+            if (const auto it = m_hardware.find(madrReg); it != m_hardware.end())
+                madr = it->second;
+            if (const auto it = m_hardware.find(in ? kDma11Bcr : kDma12Bcr); it != m_hardware.end())
+                bcr = it->second;
+            const uint32_t words = in ? ps2x::sio2::dma11(madr, bcr, value) : ps2x::sio2::dma12(madr, bcr, value);
+            if (words == 0u)
+            {
+                m_hardware[address] = value;   // PCSX2 returns early for an unhandled CHCR mode: the channel stays as written
+                return;
+            }
+            m_hardware[madrReg] = madr;
+            m_hardware[address] = value & ~(1u << 24);
+            m_dmaStart = DmaStart{in ? 0x2C : 0x2D, std::max<uint64_t>(words, 1u)};
             return;
         }
         switch (address)

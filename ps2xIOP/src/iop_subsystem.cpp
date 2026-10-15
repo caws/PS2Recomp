@@ -229,6 +229,11 @@ namespace ps2x::iop
         return m_impl->emulator.cycles();
     }
 
+    void IopSubsystem::setPadSource(PadSource source)
+    {
+        m_impl->emulator.setPadSource(std::move(source));
+    }
+
     void IopSubsystem::setSpu2Enabled(bool enabled)
     {
         m_impl->emulator.setSpu2Enabled(enabled);
