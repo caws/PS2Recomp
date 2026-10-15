@@ -28,7 +28,7 @@ public:
     GifArbiter() = default;
     explicit GifArbiter(ProcessPacketFn processFn);
 
-    void setProcessPacketFn(ProcessPacketFn fn) { m_processFn = std::move(fn); }
+    void setProcessPacketFn(ProcessPacketFn fn); // also makes this the arbiter the ring's Drain command drains
     using DrainDoneFn = std::function<void()>;
     void setDrainDoneFn(DrainDoneFn fn) { m_drainDoneFn = std::move(fn); } // cont.230
 

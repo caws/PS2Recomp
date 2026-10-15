@@ -19,6 +19,20 @@ GifArbiter::GifArbiter(ProcessPacketFn processFn)
     g_currentArbiter = this;
 }
 
+// amo_recomp row 289: the runtime's arbiter is default-constructed and wired here, so only the constructor above
+// registered an arbiter and g_currentArbiter stayed null -- the GS pipeline's end-of-pass Drain command
+// (ps2_gs_pipeline.cpp Kind::Drain, PS2X_GS_PIPELINE=1/2, default 2) drained nothing. A pass's packets then waited
+// for whatever drained next, and the path-priority sort put the next pass's PATH2 ahead of them: Auto Modellista's
+// flPS2SwapDBuff FRAME/XYOFFSET packet (PATH3, sent after the frame's VIF1 list, then sceDmaSync) reached the GS
+// only after the NEXT frame's PATH2 clear, which hit the buffer just displayed -- every other frame black. On
+// hardware the GIF has finished a transfer the EE has seen complete before anything kicked later (PCSX2 Gif_Unit:
+// one FIFO, paths arbitrated at packet boundaries); PS2X_GS_PIPELINE=0 drains in place and never had this.
+void GifArbiter::setProcessPacketFn(ProcessPacketFn fn)
+{
+    m_processFn = std::move(fn);
+    g_currentArbiter = this;
+}
+
 bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
 {
     if (!data || sizeBytes < 16u)
