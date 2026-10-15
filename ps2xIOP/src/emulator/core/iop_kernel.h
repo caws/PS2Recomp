@@ -19,6 +19,7 @@ namespace ps2x::iop::detail
         Delay,
         Semaphore,
         EventFlag,
+        MessageBox,
         Suspended,
         Dead,
     };
@@ -41,6 +42,7 @@ namespace ps2x::iop::detail
         uint32_t waitMode = 0;
         uint32_t waitResultAddress = 0;
         int wakeupCount = 0;
+        uint64_t waitSequence = 0;   // FIFO order among threads waiting on one object (message boxes)
     };
 
     class IopKernel
@@ -53,6 +55,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool dispatchThreadImport(uint16_t ordinal, IopCpuState &cpu, uint64_t currentCycle);
         [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu);
         [[nodiscard]] bool dispatchEventImport(uint16_t ordinal, IopCpuState &cpu);
+        [[nodiscard]] bool dispatchMessageBoxImport(uint16_t ordinal, IopCpuState &cpu);
 
         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
@@ -86,7 +89,22 @@ namespace ps2x::iop::detail
             uint32_t option = 0;
         };
 
+        // thmsgbx message box. Messages are guest iop_message_t (next @+0, priority byte @+4) kept, as the
+        // IOP kernel keeps them, in a circular list threaded through their own `next` words: `newest` points
+        // at the last message and newest->next at the oldest (ps2sdk iop/system/threadman/src/thmsgbx.c).
+        struct MessageBox
+        {
+            int id = 0;
+            uint32_t attr = 0;
+            uint32_t option = 0;
+            uint32_t newest = 0;
+            int count = 0;
+        };
+
         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
+        void messageBoxSend(MessageBox &box, uint32_t message);
+        [[nodiscard]] uint32_t messageBoxTake(MessageBox &box);
+        [[nodiscard]] IopThread *firstMessageBoxWaiter(const MessageBox &box);
         void wakeOneSemaphore(int id);
         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
         void wakeEventWaiters(EventFlag &event);
@@ -95,6 +113,9 @@ namespace ps2x::iop::detail
         std::map<int, IopThread> m_threads;
         std::map<int, Semaphore> m_semaphores;
         std::map<int, EventFlag> m_eventFlags;
+        std::map<int, MessageBox> m_messageBoxes;
+        uint32_t m_nextMessageBoxId = 1;
+        uint64_t m_waitSequence = 0;
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
