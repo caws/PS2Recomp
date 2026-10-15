@@ -666,6 +666,28 @@ namespace ps2_stubs
         setReturnS32(ctx, 1);
     }
 
+    // sceCdLayerSearchFile(fp, name, layer): libcdvd's sceCdSearchFile is exactly
+    // sceCdLayerSearchFile(fp, name, 0) (verified in SLES_511.91: 0x113548 = jal 0x113230 with a2=0),
+    // and middleware calls the layer form directly (CRI dvCiCdSearchFile 0x182630). Left unstubbed, the
+    // SDK body binds the IOP CDVDFSV search service (sid 0x80000597), which nothing serves here, and
+    // spins forever. The extracted disc tree has no layers, so every layer resolves through the same
+    // lookup; a non-zero layer is logged once (it only exists on dual-layer DVD-9 discs).
+    void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const int32_t layer = static_cast<int32_t>(getRegU32(ctx, 6));
+        if (layer != 0)
+        {
+            static bool warned = false;
+            if (!warned)
+            {
+                warned = true;
+                std::cerr << "[sceCdLayerSearchFile] layer " << layer
+                          << " requested; the extracted disc has no layers, searching it as layer 0" << std::endl;
+            }
+        }
+        sceCdSearchFile(rdram, ctx, runtime);
+    }
+
     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         restartCdStreamAt(getRegU32(ctx, 4), runtime);
