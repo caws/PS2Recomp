@@ -17,6 +17,7 @@
 #include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
 #include "spu2/ps2x_spu2.h"
+#include "usb/ps2x_usb.h"
 #include "ps2x/iop/iop_native_bridge.h"
 
 #include <algorithm>
@@ -46,6 +47,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
         constexpr int kSpu2Irq = 9;   // PCSX2 IopIrq.cpp spu2Irq: iopIntcIrq(9)
+        constexpr int kUsbIrq = 22;   // PCSX2 IopIrq.cpp usbIrq -> IopEvt_USB: the OHCI controller's IOP interrupt line
         constexpr uint64_t kSpu2TickCycles = 768u;   // PCSX2 IopCounters: counter 6 (the SPU2) rate, one 48 kHz sample
 
         uint32_t physicalAddress(uint32_t address)
@@ -73,7 +75,8 @@ namespace ps2x::iop::detail
 
     }
 
-    class IopEmulator::Impl final : public IopGuestExecutor, public ps2x::spu2::Host, public ps2x::iop::IopNativeServices
+    class IopEmulator::Impl final : public IopGuestExecutor, public ps2x::spu2::Host, public ps2x::usb::Host,
+                                    public ps2x::iop::IopNativeServices
     {
     public:
         using CpuState = IopCpuState;
@@ -120,6 +123,8 @@ namespace ps2x::iop::detail
               imports(memory),
               loadcore(memory, imports)
         {
+            if (IopMemory::usbEnabled())
+                ps2x::usb::attach(this);
             reset();
         }
 
@@ -134,6 +139,7 @@ namespace ps2x::iop::detail
             intrman.reset();
             timrman.reset();
             ioman.reset();
+            ps2x::usb::reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -231,6 +237,21 @@ namespace ps2x::iop::detail
         uint8_t *iopRam() override
         {
             return const_cast<uint8_t *>(memory.ram().data());
+        }
+
+        // ---- the USB controller's view of this IOP (ps2x::usb::Host) ------------------------------------------------
+        void usbInterrupt(int delayCycles) override
+        {
+            // PCSX2 IopIrq.cpp usbIrq: PSX_INT(IopEvt_USB, cycles) -> iopIntcIrq(22) after `cycles`.
+            const uint64_t due = totalCycles + static_cast<uint64_t>(delayCycles > 0 ? delayCycles : 0);
+            const auto it = pendingDmaInterrupts.find(kUsbIrq);
+            if (it == pendingDmaInterrupts.end() || it->second > due)
+                pendingDmaInterrupts[kUsbIrq] = due;
+        }
+
+        uint64_t iopCycles() const override
+        {
+            return totalCycles;
         }
 
         void spu2Interrupt() override

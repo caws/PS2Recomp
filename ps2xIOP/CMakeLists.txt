@@ -53,6 +53,21 @@ target_compile_options(ps2x_spu2 PRIVATE
     -include ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/spu2/shim/ps2x_spu2_prelude.h -w)
 target_link_libraries(ps2_iop PRIVATE ps2x_spu2)
 
+# ---- PCSX2's USB OHCI controller (GPL-3.0+, see src/emulator/usb/README.md) ------------------------------------------
+add_library(ps2x_usb STATIC
+    src/emulator/usb/ps2x_usb.cpp
+    src/emulator/usb/pcsx2/USB/qemu-usb/usb-ohci.cpp
+    src/emulator/usb/pcsx2/USB/qemu-usb/core.cpp
+    src/emulator/usb/pcsx2/USB/qemu-usb/bus.cpp
+)
+target_compile_features(ps2x_usb PUBLIC cxx_std_20)
+target_include_directories(ps2x_usb PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/usb/shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/usb/pcsx2)
+target_compile_options(ps2x_usb PRIVATE
+    -include ${CMAKE_CURRENT_SOURCE_DIR}/src/emulator/usb/shim/ps2x_usb_prelude.h -w)
+target_link_libraries(ps2_iop PRIVATE ps2x_usb)
+
 target_include_directories(ps2_iop
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

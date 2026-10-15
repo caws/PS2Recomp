@@ -1,4 +1,6 @@
 #include "iop_memory.h"
+#include "../usb/ps2x_usb.h"
+#include <cstdlib>
 #include "../spu2/ps2x_spu2.h"
 
 #include <algorithm>
@@ -235,8 +237,19 @@ namespace ps2x::iop::detail
                (phys >= SifBase && phys < SifEnd);
     }
 
+    // The USB host controller (PCSX2's OHCI, emulator/usb/): always present on hardware, so on by default;
+    // PS2X_IOP_USB=0 restores the plain register store (A/B). PCSX2 USBread32/USBwrite32 are 32-bit only (its 8/16-bit
+    // reads return 0 and writes are dropped); here sub-word accesses reach it as read-modify-write of the word.
+    bool IopMemory::usbEnabled()
+    {
+        static const bool on = [] { const char *e = std::getenv("PS2X_IOP_USB"); return !(e && e[0] == '0'); }();
+        return on;
+    }
+
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        if (address >= ps2x::usb::kRegBase && address < ps2x::usb::kRegEnd && usbEnabled())
+            return ps2x::usb::read32(address);
         if (m_spu2Enabled)
         {
             if (address == kDmaSpu0Madr || address == kDmaSpu1Madr)
@@ -262,6 +275,11 @@ namespace ps2x::iop::detail
 
     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
     {
+        if (address >= ps2x::usb::kRegBase && address < ps2x::usb::kRegEnd && usbEnabled())
+        {
+            ps2x::usb::write32(address, value);
+            return;
+        }
         switch (address)
         {
         case 0x1F801070u:
